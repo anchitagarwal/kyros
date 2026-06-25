@@ -1,3 +1,6 @@
+# Secrets
+.env
+
 # Virtual environment
 .venv/
 venv/

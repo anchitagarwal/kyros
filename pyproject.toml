@@ -8,9 +8,14 @@ version = "0.1.0"
 description = "Agent orchestration framework for quantitative trading research"
 requires-python = ">=3.11"
 dependencies = [
+    "anthropic>=0.112.0",
+    "bs4>=0.0.2",
+    "litellm>=1.89.3",
     "numpy>=1.26",
     "pandas>=2.0",
+    "python-dotenv>=1.2.2",
     "pyyaml>=6.0",
+    "tenacity>=9.1.4",
 ]
 
 [project.optional-dependencies]
@@ -20,4 +25,4 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]

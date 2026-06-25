@@ -1,19 +1,27 @@
 {
-    "project": "kyros",
-    "current_phase": "phase_1",
-    "active_branch": "main",
-    "locked_files": [],
-    "last_test_status": null,
-    "infrastructure": {
-      "planner": {
-        "provider": "anthropic",
-        "model": "claude-opus-4-8",
-        "temperature": 0.2
-      },
-      "executor": {
-        "provider": "openai",
-        "model": "gpt-5.5",
-        "temperature": 0.0
-      }
+  "project": "kyros",
+  "current_phase": "phase_1",
+  "active_branch": "main",
+  "locked_files": [],
+  "last_test_status": "pass",
+  "last_review_status": "APPROVE",
+  "evaluator_round": 0,
+  "max_evaluator_rounds": 3,
+  "infrastructure": {
+    "planner": {
+      "provider": "anthropic",
+      "model": "claude-opus-4-8",
+      "temperature": 0.2
+    },
+    "executor": {
+      "provider": "zai",
+      "model": "glm-5.2",
+      "temperature": 0.0
+    },
+    "evaluator": {
+      "provider": "zai",
+      "model": "glm-4.7",
+      "temperature": 1.0
     }
   }
+}
