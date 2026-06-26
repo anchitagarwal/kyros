@@ -1,118 +1,147 @@
-"""
-main.py — Kyros Phase 1 entry point.
-
-Run from the repo root:
-    uv run python main.py
-
-PROBLEM_STATEMENT / END_GOAL / CONSTRAINTS are the problem instance —
-what to build, where, and what hard limits apply. They change per task.
-
-Agent behavior (how the Planner researches, what ICT concepts to cover,
-how the Executor implements, what the Evaluator checks) lives in
-config/prompts.yaml — the single source of truth for domain knowledge.
-"""
-
-import logging
 import sys
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from kyros.core.orchestrator import EscalationRequired, Orchestrator, OrchestratorError
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger("kyros")
-
-
-# ── Phase 1 Problem Definition ─────────────────────────────────────────────────
+from kyros.core.orchestrator import Orchestrator, EscalationRequired, OrchestratorError
 
 PROBLEM_STATEMENT = """
-Project Kyros Phase 1: Sensory Foundation.
+Build the Phase 2 Agentic Reasoning Engine for Project Kyros: a non-stop Python
+trading loop that ingests OHLCV candle data, runs ICT analysis via Phase 1
+detectors, and calls an LLM to produce structured JSON trade alerts when market
+conditions are worth reasoning about.
 
-Build a complete ICT (Inner Circle Trader) detector library as standalone,
-pure-Python modules in workspace/detectors/. The scope is the full ICT
-concept surface — not limited to detectors already in ATLAS. The Planner
-will research ICT theory, survey all implementable concepts, cross-reference
-against the knowledge base, and produce a blueprint for every detector that
-can be expressed deterministically on OHLCV candle data.
+The system uses a mock/replay CandleSource for Phase 2 (no live data, no broker).
+The LLM receives a pre-computed MarketSnapshot and outputs an AlertPayload.
+Python validates R:R after every LLM call — alerts below 1:1 become no_trade
+entries in the log.
 
-The ATLAS legacy codebase is available as a read-only correctness reference
-for concepts it has already implemented. Nothing in the ported or newly
-written code should reference ATLAS, IBKR, or any database.
+Key architectural decisions already made:
+- LLM-as-judge: all Phase 1 detectors run upfront, LLM synthesizes
+- TriggerEngine gates LLM calls: killzone + HTF bias + DOL existence + cooldown
+- DOL (draw on liquidity) drives TP, SL, and R:R
+- ICT models the LLM recognizes: 2022, Unicorn, iFVG, Silver Bullet, Breaker
+- Low hanging fruit: if no intermediate unswept liquidity blocks path to DOL
+- Single model_router.call() per trigger — not call_agentic
 """
 
 END_GOAL = """
-A workspace/detectors/ package containing one module per ICT concept,
-as determined by the Planner's research. At minimum this includes:
+A tested, runnable TradingLoop that:
+1. Accepts a CandleSource (MockCandleSource or ReplayCandleSource)
+2. Maintains a CandleWindow per timeframe (4h/1h/15m/5m/1m)
+3. Builds a MarketSnapshot via SnapshotBuilder using Phase 1 detectors
+4. Evaluates TriggerEngine on every new candle
+5. Calls the LLM Reasoning Agent when triggered
+6. Validates R:R (minimum 1:1) post-LLM call
+7. Emits AlertPayload to JSON log file and stdout
 
-  workspace/detectors/__init__.py
-  workspace/detectors/candles.py     — OHLCV ingestion and validation
-  workspace/detectors/<concept>.py   — one file per detector concept
-
-Each module exposes one public function:
-  detect_<name>(candles: list[dict]) -> list[dict]
-
-Candle dicts have keys: open, high, low, close, volume, timestamp.
-Each detection dict includes at minimum: type, timestamp, and any
-module-specific fields defined in the blueprint.
-
-Accompanied by tests/test_<module>.py for every module.
-All tests must pass with: pytest tests/
+Full test suite runnable with MockCandleSource — no live data or API keys needed.
 """
 
 CONSTRAINTS = """
-- Phase 1 only: no IBKR, no database, no broker, no order execution
-- Detector modules use only pandas and numpy — no other external dependencies
-- Public interface is list[dict] in, list[dict] out — no DataFrames at the boundary
-- Every function is stateless: same input always produces same output
-- Port or implement detection logic only — do not port ATLAS infrastructure
-- Executor must write workspace/contract.md before writing any code
-- Planner must blueprint all detectors in one pass — scope is the full ICT
-  surface, not a subset
+HARD CONSTRAINTS:
+- No broker, no IBKR, no order placement, no live data
+- Phase 1 detectors (workspace/detectors/) are READ-ONLY — do not modify
+- Reuse existing ModelRouter, ExecutorToolkit, KyrosAgentLoader
+- Do NOT use call_agentic() for the trading agent — use call() only
+- Python validates R:R post-LLM — never trust LLM arithmetic
+- Alert output: JSON log + stdout only. No Telegram in Phase 2
+
+ARCHITECTURE:
+Timeframe stack:
+  4h  → 60 candles  (weekly structure, HTF bias)
+  1h  → 100 candles (daily structure, session context)
+  15m → 200 candles (setup timeframe)
+  5m  → 300 candles (entry timeframe)
+  1m  → 500 candles (precision / MSS confirmation)
+
+TriggerEngine — 4 hard gates (ALL must pass):
+  1. current_killzone is not None
+  2. htf_bias is not None (confirmed BOS/ChoCH on 4h or 1h)
+  3. nearest_dol is not None (unswept opposing pool exists)
+  4. cooldown clear (15 min since last LLM call)
+
+TriggerEngine — soft triggers (ANY is sufficient):
+  - Active unmitigated FVG on 5m
+  - iFVG on 5m
+  - Liquidity sweep on 15m in last 10 candles
+  - Displacement on 5m in last 10 candles
+
+DOL logic:
+  - SnapshotBuilder delivers all_pools: all unswept opposing pools across
+    all timeframes, sorted by proximity, with confluence_count
+  - LLM selects target pool from all_pools and explains why in rationale
+  - LLM considers: HTF significance, confluence, whether intermediate
+    pools block path
+  - Python validates selected target gives >= 1:1 R:R
+  - TriggerEngine gate: any unswept opposing pool exists (binary, no threshold)
+
+GOLDEN DATASET:
+  - workspace/knowledge_base/alerts_ict.md contains 1,965 real ICT trade alerts
+    from the TTT community — treat as ground truth for validation
+  - Executor writes scripts/build_golden_dataset.py: LLM extraction pass
+    that parses alerts_ict.md into workspace/knowledge_base/golden_alerts.json
+  - Include integration tests that replay candles from golden alert dates
+    and assert TradingLoop triggers with matching direction
+  - Planner should analyze alert frequency by model type when designing
+    the system prompt — let the community's actual usage inform weighting
+
+ICT SYSTEM PROMPT:
+  - LLM identifies which model applies per alert:
+      2022     → AMD structure: sweep → displacement → FVG retracement
+      unicorn  → BOS displacement FVG + OB at same level
+      ifvg     → filled FVG now acting as opposing S/R
+      silver_bullet → 10:00-11:00 ET or 14:00-15:00 ET displacement FVG
+      breaker  → failed OB flipped to opposing S/R
+      none     → no_trade
+  - DOL-first reasoning: enumerate all unswept pools, target nearest in bias
+    direction after sweep. If intermediate unswept pool exists between entry
+    and DOL, output no_trade with reason "intermediate liquidity in path"
+  - Output structured JSON only — no prose outside the JSON block
+
+ALERT OUTPUT SCHEMA:
+{
+  "bias":           "long | short | no_trade",
+  "model":          "2022 | unicorn | ifvg | silver_bullet | breaker | none",
+  "conviction":     0-100,
+  "entry_zone":     [float, float],
+  "stop":           float,
+  "target":         float,
+  "dol": {
+    "level":        float,
+    "type":         str,
+    "timeframe":    str
+  },
+  "risk_reward":    float,
+  "rationale":      str,
+  "killzone":       str,
+  "valid_until":    str,
+  "no_trade_reason": str | null
+}
+
+INSTRUMENT: NQ only (/NQ=F) for Phase 2
 """
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
-
-def main() -> None:
-    log.info("Kyros — Phase 1: Sensory Foundation")
-    log.info("─" * 48)
-
+def main():
     orch = Orchestrator()
-    log.info("Workspace : %s", orch._ws)
-    log.info("Scope     : full ICT detector surface (Planner determines)")
-    log.info("─" * 48)
-
     try:
         result = orch.run(
             problem_statement=PROBLEM_STATEMENT,
             end_goal=END_GOAL,
             constraints=CONSTRAINTS,
         )
-
-        log.info("─" * 48)
-        log.info("✓  APPROVED in %d round(s)", result.rounds_taken)
-        log.info("   Blueprint : %s", result.blueprint_path)
-        log.info("   Review    : %s", result.review_path)
-        log.info("   Tokens    : %d total", result.total_tokens)
-
+        print(f"\nPhase 2 complete in {result.rounds_taken} round(s).")
+        print(f"Total tokens: {result.total_tokens:,}")
+        print(f"Blueprint: {result.blueprint_path}")
     except EscalationRequired as e:
-        log.info("─" * 48)
-        log.warning("⚠  ESCALATED — human review required")
-        log.warning("   Reason : %s", e.reason)
-        log.warning("   Review : %s", e.review_path)
-        log.warning("   Open the review file, address findings, then re-run.")
+        print(f"\nNeeds human review — {e.reason}")
+        print(f"Review file: {e.review_path}")
         sys.exit(1)
-
     except OrchestratorError as e:
-        log.info("─" * 48)
-        log.error("✗  Infrastructure error: %s", e)
-        log.error("   Check your API keys and network, then re-run.")
+        print(f"\nInfrastructure error: {e}")
+        print("Check your API keys and network, then re-run.")
         sys.exit(2)
 
 

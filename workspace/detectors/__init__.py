@@ -9,7 +9,7 @@ Modules:
     market_structure  — detect_swings, detect_bos, detect_choch
     fair_value_gaps   — detect_fvg, detect_ifvg
     displacement      — detect_displacement
-    sessions          — detect_sessions, detect_kill_zones
+    sessions          — detect_sessions, detect_kill_zones, detect_session_levels
     volume_imbalance  — detect_volume_imbalance, detect_opening_gaps
     liquidity         — detect_equal_levels, detect_prior_levels,
                         detect_liquidity_sweeps
@@ -23,7 +23,7 @@ from .candles import validate_candles, candle_metrics
 from .market_structure import detect_swings, detect_bos, detect_choch
 from .fair_value_gaps import detect_fvg, detect_ifvg
 from .displacement import detect_displacement
-from .sessions import detect_sessions, detect_kill_zones
+from .sessions import detect_sessions, detect_kill_zones, detect_session_levels
 from .volume_imbalance import detect_volume_imbalance, detect_opening_gaps
 from .liquidity import (
     detect_equal_levels,
@@ -46,6 +46,7 @@ __all__ = [
     "detect_displacement",
     "detect_sessions",
     "detect_kill_zones",
+    "detect_session_levels",
     "detect_volume_imbalance",
     "detect_opening_gaps",
     "detect_equal_levels",
