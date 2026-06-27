@@ -200,9 +200,9 @@ def _validate_record(rec: dict, fallback_date: str, fallback_time: str,
 
 def _default_agent_config() -> dict:
     """Minimal agent_config for model_router.call(). Mirrors the executor's
-    zai/glm-5.2 setup from .kyros_state.json."""
+    zai/glm-4.6 setup from .kyros_state.json."""
     return {
-        "model_engine": {"provider": "zai", "model": "glm-5.2", "temperature": 0.0},
+        "model_engine": {"provider": "zai", "model": "glm-4.6", "temperature": 0.0},
         "final_system_prompt": "",
     }
 

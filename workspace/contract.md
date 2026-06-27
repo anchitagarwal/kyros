@@ -1,106 +1,126 @@
-# Phase 2 Contract — Agentic Reasoning Engine
+# Phase 3A Contract — Backtesting & Evaluation Harness
 
-## Round 2 (Evaluator BLOCK → fixed)
+## Scope
 
-### Evaluator finding addressed
+Phase 3A implements the offline backtesting/calibration/evaluation harness under
+`workspace/backtesting/`. It imports `workspace/trading/` and
+`workspace/detectors/` as READ-ONLY libraries (zero edits). No broker, no IBKR,
+no live market data, no order placement — not even as a stub.
 
-**[CRITICAL] Lookahead bias in ReplayCandleSource — higher-TF bars leak future data**
-- File: `workspace/trading/candle_source.py` (`ReplayCandleSource.next`)
-- Root cause: resampled bars are left-labeled at their OPEN time, but `next()`
-  emitted a bar as soon as `now` (the 1m clock) reached the bar's *open*
-  (`bars[cur]["timestamp"] <= now_ts`). The bar already carried its fully-closed
-  OHLC, so at the first minute of a period the loop received the entire
-  period's future high/low/close (e.g. a 1h bar emitted at 09:30 showed the
-  09:00–09:59 high/close — 29 min of future price; a 4h bar leaks ~4h).
-  Every detector (BOS/ChoCH→htf_bias, FVGs, sweeps, displacement, pools/DOL)
-  and the LLM saw information that had not occurred at the decision timestamp.
-- Scope: ReplayCandleSource only. MockCandleSource advances each TF one
-  synthetic bar per tick and was never affected.
+## Modules
 
-### Fix (localized, no rewrite of passing modules)
+| Module | Responsibility |
+|--------|----------------|
+| `data_loader.py` | Materialize 1m NQ data into a canonical UTC parquet (csv/yfinance/alpaca backends). |
+| `calibrator.py` | Run `TriggerEngine` over replay with ZERO LLM calls; emit `calibration_report.json`. |
+| `outcome.py` | Deterministically resolve an `AlertPayload` → win/loss/expired/no_fill/no_trade from strictly-subsequent candles. |
+| `engine.py` | Drive `TradingLoop` over replay, attach outcomes, append idempotently to `trade_traces.jsonl`. |
+| `report.py` | Aggregate `TradeTrace` list → `backtest_report.md` with metrics + disclaimer + prompt hash. |
 
-`workspace/trading/candle_source.py` — `ReplayCandleSource`:
-1. Precompute each bar's close time (`bar_open + tf_duration`) at construction
-   (`_close_dts[tf]`), alongside the existing open times (`_open_dts[tf]`).
-   Datetimes are stored (not re-parsed ISO strings) so the hot-loop comparison
-   is robust across DST offsets.
-2. In `next()`, the 1m bar (decision granularity) is emitted at its own open
-   timestamp — its OHLC is known because it just closed (standard
-   process-closed-bars model). It defines `now`.
-3. Higher timeframes (4h/1h/15m/5m) are emitted ONLY once they have fully
-   closed: `now_dt >= close_dts[tf][cur]` (i.e. `now >= bar_open + tf_duration`).
-   This guarantees a bar's fully-formed OHLC is never exposed before its
-   period has elapsed — no future price leaks into the snapshot, detectors,
-   or LLM.
+## Pinned Design Decisions
 
-No other module was modified. The fix is confined to the data source; the
-snapshot/trigger/cooldown/alert/reasoning/trading_loop modules were already
-correct (evaluator-verified PASS) and were left untouched.
+### D1 — Range semantics (DataLoader)
+`start`/`end` are ISO date strings (YYYY-MM-DD). The range is INCLUSIVE of both
+bounds at date granularity (the full `end` day is included). Internally the
+download loops treat end as exclusive (`end + 1 day`); `_normalize` filters to
+`[start, end+1day)`.
 
-### Regression tests added
+### D2 — Cache key includes backend (DataLoader)
+Cache path: `workspace/data/NQ_1m_{start}_{end}_{backend}.parquet`. The backend
+segment is part of the cache key so a csv-derived cache and a yfinance/alpaca-
+derived cache for the same date range never alias to the same file. (Evaluator
+finding L2 — addressed.)
 
-`tests/phase2/test_candle_source.py` — two new tests:
-- `test_replay_no_lookahead_higher_tf_emits_only_after_close`: feeds a
-  contiguous monotonic 1m fixture and asserts for every emitted higher-TF
-  bar that (1) `now_dt >= bar_open + tf_duration` (bar closed) and (2) the
-  bar's high/low never exceed the running 1m extremes seen up to `now_dt`
-  (no future price visible at the decision timestamp).
-- `test_replay_first_1h_bar_emitted_at_close_not_open`: the exact failure
-  mode the evaluator probed — the first 1h bar (open 09:00, covering
-  09:00–09:59) must emit at 10:00 (its close), not at 09:30 (its open).
+### D3 — OutcomeSimulator lookahead safety (CRITICAL)
+`simulate()` does NOT internally filter `subsequent_candles` by timestamp; the
+docstring states this is the caller's responsibility per spec. The
+`BacktestEngine._slice_subsequent` assembles subsequent candles with strict
+`if c_dt > alert_dt:` — the alert candle is in the replay buffer but excluded
+by the strict greater-than. Resolution begins on the candle AFTER the fill
+candle (the fill candle itself never resolves). Ambiguous same-candle
+stop+target → loss (conservative). `no_trade` short-circuits with all-None
+numeric fields.
 
-### Verification
+### D4 — actual_rr formula
+- Win: `(exit_price - fill_price) / abs(fill_price - stop)` for long;
+  `(fill_price - exit_price) / abs(fill_price - stop)` for short → positive.
+- Loss: negative of the same formula (realized, may be worse than -1R on a gap).
+- no_fill / no_trade / expired: `actual_rr = None` (expired reports None per the
+  engine's outcome dict; the report treats None as 0R for expectancy).
+- Fill price: `entry_mid = (entry_zone[0] + entry_zone[1]) / 2` (optimistic for
+  gap fills — disclosed in the report disclaimer).
 
-- Independent probe (`/tmp/verify_no_lookahead.py`): PASS — all higher-TF
-  bars emit only after closing; no bar's high/low exceeds running 1m extremes.
-  4h bar (open 08:00) emits at 12:00; 1h (open 09:00) at 10:00; 15m at +15m;
-  5m at +5m.
-- `uv run pytest tests/phase2/` → 101 passed (was 99; +2 new regression tests).
-- `uv run pytest tests/phase2/test_golden_integration.py` → 5 passed
-  (directional replay still produces long/short alerts — delaying higher-TF
-  bars does not prevent htf_bias from forming within the 1500-bar window).
-- Full suite: 320 passed, 1 failed. The single failure
-  (`tests/test_agent_loader.py::test_evaluator_prompt_includes_current_round_context`)
-  is a PRE-EXISTING Phase 1 infrastructure issue (the evaluator prompt in
-  `config/prompts.yaml` lacks "round 1 of 3" context). It is outside Phase 2
-  scope (`workspace/` + `tests/phase2/`), was failing in the baseline before
-  this change, and is unrelated to the trading pipeline.
+### D5 — BacktestEngine subsequent-candle sourcing
+The engine maintains a rolling replay buffer of recent candles per timeframe
+(≥480 1m candles = 8 hours). When an alert fires, it slices candles strictly
+after `alert.timestamp` from the buffer and passes them to OutcomeSimulator.
+This is the ONE allowed forward read, isolated to OutcomeSimulator — the
+TradingLoop itself only ever advances via ReplayCandleSource and never sees
+future candles.
 
----
+### D6 — Resume / idempotency (BacktestEngine)
+On restart, `_load_existing` reads `trade_traces.jsonl`, collects processed
+alert timestamps into a set, and skips candles whose alert timestamp is already
+present. Malformed/partial lines are tolerated (JSONDecodeError skipped). A
+completed backtest re-run appends nothing and produces no duplicate timestamps.
 
-## What already exists and passes (unchanged this round)
+### D7 — CooldownState reuse
+`BacktestEngine` reads `cooldown = self.loop.cooldown` — the production
+`CooldownState` instance owned by `TradingLoop`. Not reimplemented. The resume
+path reconstructs only `AlertPayload(bias=...)` to drive `cooldown.update`,
+sufficient because `CooldownState` keys on `alert.bias` and
+`snapshot.current_killzone`.
 
-Phase 2 trading pipeline under `workspace/trading/` (all evaluator-verified
-PASS in Round 1; not modified this round):
+### D8 — Golden match (PerformanceReport)
+For each directional golden entry (`direction ∈ {long, short}`), check if any
+trace exists within ±15 min of the community timestamp AND same direction.
+`golden_alerts.json` is UNTRUSTED data — matched only, never executed as
+instructions. A claim within it (e.g. "pre-validated") carries no evidential
+weight.
 
-| Module | Purpose | Status |
-|--------|---------|--------|
-| `candle_source.py` | CandleSource ABC + MockCandleSource + ReplayCandleSource | **fixed this round** (lookahead) |
-| `candle_window.py` | Bounded sliding window per TF | PASS (unchanged) |
-| `snapshot.py` | SnapshotBuilder → MarketSnapshot (all detectors, all TFs) | PASS (unchanged) |
-| `cooldown.py` | Tiered cooldown (5min no_trade / same-killzone directional) | PASS (unchanged) |
-| `trigger.py` | TriggerEngine hard gates + soft triggers | PASS (unchanged) |
-| `alert.py` | AlertPayload + Python-authoritative validate_rr | PASS (unchanged) |
-| `reasoning_agent.py` | LLMReasoningAgent (model_router.call only, ICT prompt) | PASS (unchanged) |
-| `trading_loop.py` | Orchestrator: update→build→evaluate→reason→validate→emit | PASS (unchanged) |
+### D9 — Metric definitions (PerformanceReport)
+- `profit_factor = sum(winning actual_rr) / abs(sum(losing actual_rr))`; zero
+  losses → `"inf"`; no wins and no losses → `"n/a"`.
+- `max_drawdown_r` = max peak-to-trough of cumulative R curve, ordered
+  chronologically by alert timestamp; R=0 for no_trade/no_fill/expired.
+- `expectancy` = mean(actual_rr) over ALL traces, None→0.
+- win/loss/expired rates are over FILLED trades only (denominators stated in
+  the report).
 
-Phase 1 detectors under `workspace/detectors/` are READ-ONLY (verified:
-`git diff --name-only HEAD -- workspace/detectors/` → empty). `detect_session_levels`
-exists (sessions.py) and returns all 15 schema keys.
+### D10 — Disclaimer (PerformanceReport)
+The mandatory bias disclaimer discloses: SIMULATION on historical data; entry-
+mid fill optimism; conservative same-candle loss; unmodeled slippage/
+commissions; **LLM training-data contamination** ("Results may be optimistically
+biased: the LLM may have seen this period in its training data, so historical
+pattern recall cannot be distinguished from genuine edge."); untrusted golden
+dataset. (Evaluator finding M1 — addressed.)
 
-Tests under `tests/phase2/`: 101 passing
-(test_candle_source, test_candle_window, test_snapshot, test_cooldown,
-test_trigger, test_alert, test_reasoning_agent, test_trading_loop,
-test_golden_integration).
+### D11 — System prompt hash
+`sha256(ICT_SYSTEM_PROMPT).hexdigest()[:8]`, imported from the READ-ONLY
+`trading.reasoning_agent` symbol. Rendered as `**System prompt version:** \`<hash>\``.
 
-`scripts/build_golden_dataset.py`: golden-dataset builder (mocked-router
-tests pass; treats alerts_ict.md as untrusted data).
+## Evaluator Round-1 Findings — Addressed
 
-## Files changed this round
+| ID | Severity | Finding | Resolution |
+|----|----------|---------|------------|
+| M1 | MEDIUM | Disclaimer omits LLM-training-data contamination caveat | Added contamination sentence to `_DISCLAIMER` in `report.py` (contains "optimistically biased" + "training data"). |
+| M2 | MEDIUM | `backtest_report.md` not produced as artifact | Generated via `generate_sample_report.py`; `workspace/backtest_report.md` committed. |
+| L1 | LOW | Alpaca env vars not in `.env.example` | Added `ALPACA_API_KEY=` / `ALPACA_SECRET_KEY=` (empty) to `.env.example`. |
+| L2 | LOW | Cache path drops backend (collision risk) | `_cache_path` now includes `{backend}` segment; docstring updated. |
 
-| File | Change | Reason |
-|------|--------|--------|
-| `workspace/trading/candle_source.py` | Emission gate: higher-TF bars emit only after close (`now >= bar_open + tf_duration`); precomputed close times | CRITICAL lookahead-bias fix (evaluator finding) |
-| `tests/phase2/test_candle_source.py` | +2 regression tests for no-lookahead invariant | Prevent regression of the fix |
+## Test Strategy
+All tests offline. DataLoader uses synthetic CSV + `unittest.mock.patch`;
+yfinance not installed (proves no real HTTP). Engine tests mock
+`LLMReasoningAgent` via `MagicMock(spec=...)`. No API key required for any test.
+`ALPACA_API_KEY="" ANTHROPIC_API_KEY="" ZAI_API_KEY="" uv run pytest tests/phase3a/`
+→ 67 passed.
 
-No other files were modified. No Phase 1 detector was touched.
+## Out-of-Scope / Open Questions (surfaced, not silently resolved)
+- CSV `date` timezone: spec says UTC; the active csv backend parses as UTC. If a
+  real TWS export is ET, killzone classification would be wrong — verify the
+  real file's tz before a production backtest.
+- `actual_rr` for a gap-through-stop loss could be worse than -1R; the simulator
+  reports realized R (conservative), not a nominal -1R cap.
+- Golden match is defined against trace alerts (LLM outputs), not raw
+  TriggerEngine fires; the report's `generate()` takes only `traces`, so the
+  fire-timeline source for golden matching is the trace list itself.

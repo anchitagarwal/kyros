@@ -17,6 +17,12 @@ build/
 .coverage
 htmlcov/
 
+# Large / regenerable data (not for version control)
+# raw Discord export (source for knowledge_base)
+discord_ttt_dump/
+# downloaded OHLCV data (regenerate via scripts/)
+workspace/data/
+
 # OS
 .DS_Store
 
