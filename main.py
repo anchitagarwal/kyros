@@ -1,8 +1,15 @@
 import sys
+import logging
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
 
 from kyros.core.orchestrator import Orchestrator, EscalationRequired, OrchestratorError
 
@@ -76,16 +83,6 @@ DOL logic:
     pools block path
   - Python validates selected target gives >= 1:1 R:R
   - TriggerEngine gate: any unswept opposing pool exists (binary, no threshold)
-
-GOLDEN DATASET:
-  - workspace/knowledge_base/alerts_ict.md contains 1,965 real ICT trade alerts
-    from the TTT community — treat as ground truth for validation
-  - Executor writes scripts/build_golden_dataset.py: LLM extraction pass
-    that parses alerts_ict.md into workspace/knowledge_base/golden_alerts.json
-  - Include integration tests that replay candles from golden alert dates
-    and assert TradingLoop triggers with matching direction
-  - Planner should analyze alert frequency by model type when designing
-    the system prompt — let the community's actual usage inform weighting
 
 ICT SYSTEM PROMPT:
   - LLM identifies which model applies per alert:

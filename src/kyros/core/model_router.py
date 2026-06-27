@@ -65,6 +65,7 @@ provider names ("anthropic", "openai", "google") to LiteLLM strings.
 
 import json
 import logging
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -78,6 +79,13 @@ litellm.suppress_debug_info = True
 # Some models (e.g. claude-opus-4-8 extended thinking) reject temperature != 1.
 # Drop unsupported params instead of hard-failing.
 litellm.drop_params = True
+
+# Enable Langfuse tracing if credentials are present in the environment.
+# Set LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, and optionally LANGFUSE_HOST.
+if os.getenv("LANGFUSE_PUBLIC_KEY"):
+    litellm.success_callback = ["langfuse"]
+    litellm.failure_callback = ["langfuse"]
+    _log.info("Langfuse observability enabled")
 
 
 # ── Provider → LiteLLM prefix map ────────────────────────────────────────────
@@ -186,6 +194,8 @@ class ModelRouter:
         self,
         agent_config: dict,
         messages: list[dict],
+        name: str | None = None,
+        trace_id: str | None = None,
     ) -> ModelResponse:
         """
         Execute one LLM completion for the given agent config and message list.
@@ -223,6 +233,13 @@ class ModelRouter:
         # makes it easy to inspect or override in tests.
         full_messages = [{"role": "system", "content": system_prompt}, *messages]
 
+        metadata: dict = {}
+        if name:
+            metadata["generation_name"] = name
+        if trace_id:
+            metadata["trace_id"] = trace_id
+            metadata["trace_name"] = f"kyros/{name or 'call'}"
+
         try:
             raw = litellm.completion(
                 model=model_string,
@@ -230,6 +247,7 @@ class ModelRouter:
                 temperature=temperature,
                 num_retries=self.num_retries,
                 timeout=self.timeout,
+                **({"metadata": metadata} if metadata else {}),
             )
         except Exception as exc:
             raise ProviderCallError(
@@ -258,6 +276,8 @@ class ModelRouter:
         tools: list[dict],
         tool_fn: Callable[[str, dict], str],
         max_turns: int = 80,
+        name: str | None = None,
+        trace_id: str | None = None,
     ) -> ModelResponse:
         """
         Run a multi-turn tool-use loop for an agent.
@@ -296,6 +316,13 @@ class ModelRouter:
         total_completion = 0
 
         for turn in range(max_turns):
+            turn_metadata: dict = {}
+            if name:
+                turn_metadata["generation_name"] = f"{name}-turn-{turn + 1}"
+            if trace_id:
+                turn_metadata["trace_id"] = trace_id
+                turn_metadata["trace_name"] = f"kyros/{name or 'agentic'}"
+
             try:
                 raw = litellm.completion(
                     model=model_string,
@@ -304,6 +331,7 @@ class ModelRouter:
                     temperature=temperature,
                     num_retries=self.num_retries,
                     timeout=self.timeout,
+                    **({"metadata": turn_metadata} if turn_metadata else {}),
                 )
             except Exception as exc:
                 raise ProviderCallError(

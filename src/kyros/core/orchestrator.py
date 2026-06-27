@@ -68,6 +68,7 @@ File layout under workspace_root/workspace/:
 import logging
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -168,10 +169,13 @@ class Orchestrator:
             EscalationRequired: Evaluator returned ESCALATE, or max rounds hit.
             OrchestratorError: An LLM provider call failed unrecoverably.
         """
+        print("\n🚀 Starting Orchestrator run...\n")
         # Reset round counter for a clean run. If run() is called multiple
         # times (e.g. for different tasks), each gets a fresh round budget.
         self.loader.reset_evaluator_round()
         total_tokens = 0
+        trace_id = str(uuid.uuid4())
+        log.info("Langfuse trace_id: %s", trace_id)
 
         # Persist the task definition so any agent can read it from disk.
         problem_content = self._format_problem(problem_statement, end_goal, constraints)
@@ -182,10 +186,13 @@ class Orchestrator:
         # without burning another Opus call.
         if (self._ws / "blueprint.md").exists():
             log.info("Resuming: blueprint.md already exists, skipping Planner.")
+            print("✓ Blueprint already exists, skipping Planner.")
         else:
-            blueprint_response = self._run_planner(problem_statement, end_goal, constraints)
+            print("📋 Calling Planner (this may take a minute)...")
+            blueprint_response = self._run_planner(problem_statement, end_goal, constraints, trace_id)
             total_tokens += blueprint_response.usage.total_tokens
             self._write_artifact("blueprint.md", blueprint_response.content)
+            print(f"✓ Planner complete ({blueprint_response.usage.total_tokens:,} tokens)")
 
         # ── Executor → Evaluator loop ──────────────────────────────────────────
         # On resume, carry forward any existing review so the Executor knows
@@ -208,6 +215,8 @@ class Orchestrator:
                     review_path=self._ws / "review.md",
                 )
 
+            print(f"\n━━━ Round {rounds_taken + 1} ━━━")
+
             # ── Executor ───────────────────────────────────────────────────────
             # Skip the Executor if contract.md exists, no pending review, and
             # pytest actually passes right now. Run pytest directly rather than
@@ -216,30 +225,35 @@ class Orchestrator:
 
             if contract_exists and review_content is None and self._pytest_passes():
                 log.info("Resuming: pytest green and contract exists — skipping Executor.")
+                print("✓ Executor skipped (contract exists, tests pass)")
             else:
-                # Clear contract.md so the fallback always captures this round's output.
-                # In production the Executor re-writes it via tools; in tests the mock
-                # doesn't touch files so the fallback must run fresh each round.
-                (self._ws / "contract.md").unlink(missing_ok=True)
+                # Archive contract.md to artifacts/ before the Executor overwrites it.
+                # Never delete LLM-produced artifacts — move them so history is preserved.
+                self._archive_artifact("contract.md")
+                print("🔨 Calling Executor...")
                 executor_response = self._run_executor(
                     blueprint_content=self._read_artifact("blueprint.md"),
                     review_content=review_content,
+                    trace_id=trace_id,
                 )
                 total_tokens += executor_response.usage.total_tokens
+                print(f"✓ Executor complete ({executor_response.usage.total_tokens:,} tokens)")
                 if not (self._ws / "contract.md").exists():
                     self._write_artifact("contract.md", executor_response.content)
 
             # ── Evaluator ──────────────────────────────────────────────────────
-            # Clear review.md before each evaluator run so the fallback always
-            # captures this round's verdict rather than returning a stale one.
-            (self._ws / "review.md").unlink(missing_ok=True)
+            # Archive review.md to artifacts/ before the Evaluator overwrites it.
+            self._archive_artifact("review.md")
             self._cooldown_sleep()
             # Also runs as a tool-use agent: reads code, runs pytest, writes review.md.
+            print("🔍 Calling Evaluator...")
             evaluator_response = self._run_evaluator(
                 blueprint_content=self._read_artifact("blueprint.md"),
                 contract_content=self._read_artifact("contract.md"),
+                trace_id=trace_id,
             )
             total_tokens += evaluator_response.usage.total_tokens
+            print(f"✓ Evaluator complete ({evaluator_response.usage.total_tokens:,} tokens)")
             if not (self._ws / "review.md").exists():
                 self._write_artifact("review.md", evaluator_response.content)
             review_content = self._read_artifact("review.md")
@@ -250,6 +264,7 @@ class Orchestrator:
 
             # ── Route on verdict ───────────────────────────────────────────────
             if verdict == "APPROVE":
+                print(f"\n✅ APPROVED in {rounds_taken} round(s)!")
                 return OrchestratorResult(
                     status="APPROVED",
                     blueprint_path=self._ws / "blueprint.md",
@@ -261,6 +276,7 @@ class Orchestrator:
             if verdict == "ESCALATE":
                 # The Evaluator decided it cannot approve even with another
                 # iteration. Immediate escalation — don't consume another round.
+                print(f"\n⚠️  ESCALATION required — see workspace/review.md")
                 raise EscalationRequired(
                     reason="Evaluator returned ESCALATE verdict",
                     review_path=self._ws / "review.md",
@@ -270,6 +286,7 @@ class Orchestrator:
             # Incrementing the round counter here (after the Evaluator, before
             # the next Executor call) means the next get_agent_config("evaluator")
             # will inject the correct updated round number into the prompt.
+            print(f"📝 Verdict: {verdict} — addressing findings in next round...")
             self.loader.increment_evaluator_round()
 
     # ── Agent call helpers ─────────────────────────────────────────────────────
@@ -279,19 +296,20 @@ class Orchestrator:
     # caller which agent step failed.
 
     def _run_planner(
-        self, problem_statement: str, end_goal: str, constraints: str
+        self, problem_statement: str, end_goal: str, constraints: str, trace_id: str | None = None
     ) -> ModelResponse:
         config = self.loader.get_agent_config("planner")
         messages = [
             {"role": "user", "content": self._format_problem(problem_statement, end_goal, constraints)}
         ]
         try:
-            return self.router.call(config, messages)
+            print("  → Waiting for Planner response...")
+            return self.router.call(config, messages, name="planner", trace_id=trace_id)
         except RouterError as exc:
             raise OrchestratorError(f"Planner call failed: {exc}") from exc
 
     def _run_executor(
-        self, blueprint_content: str, review_content: str | None
+        self, blueprint_content: str, review_content: str | None, trace_id: str | None = None
     ) -> ModelResponse:
         config = self.loader.get_agent_config("executor")
 
@@ -306,14 +324,16 @@ class Orchestrator:
 
         messages = [{"role": "user", "content": body}]
         try:
+            print("  → Waiting for Executor response (with tool use)...")
             return self.router.call_agentic(
-                config, messages, TOOL_SCHEMAS, self.toolkit.dispatch
+                config, messages, TOOL_SCHEMAS, self.toolkit.dispatch,
+                name="executor", trace_id=trace_id,
             )
         except RouterError as exc:
             raise OrchestratorError(f"Executor call failed: {exc}") from exc
 
     def _run_evaluator(
-        self, blueprint_content: str, contract_content: str
+        self, blueprint_content: str, contract_content: str, trace_id: str | None = None
     ) -> ModelResponse:
         config = self.loader.get_agent_config("evaluator")
 
@@ -327,11 +347,35 @@ class Orchestrator:
 
         messages = [{"role": "user", "content": body}]
         try:
+            print("  → Waiting for Evaluator response (with tool use)...")
             return self.router.call_agentic(
-                config, messages, TOOL_SCHEMAS, self.toolkit.dispatch
+                config, messages, TOOL_SCHEMAS, self.toolkit.dispatch,
+                name="evaluator", trace_id=trace_id,
             )
         except RouterError as exc:
             raise OrchestratorError(f"Evaluator call failed: {exc}") from exc
+
+    # ── Artifact archival ─────────────────────────────────────────────────────
+
+    def _archive_artifact(self, filename: str) -> None:
+        """Move workspace/<filename> to artifacts/ with a timestamp suffix.
+
+        Never deletes LLM-produced artifacts — preserves them for debugging
+        and audit. No-op if the file does not exist.
+        """
+        src = self._ws / filename
+        if not src.exists():
+            return
+        artifacts_dir = self.root / "artifacts"
+        artifacts_dir.mkdir(exist_ok=True)
+        stem, suffix = filename.rsplit(".", 1) if "." in filename else (filename, "")
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        uid = str(uuid.uuid4())[:6]
+        dest_name = f"{stem}_{ts}_{uid}.{suffix}" if suffix else f"{stem}_{ts}_{uid}"
+        dest = artifacts_dir / dest_name
+        src.rename(dest)
+        log.info("Archived %s → artifacts/%s", filename, dest_name)
+        print(f"  → Archived {filename} to artifacts/{dest_name}")
 
     # ── Cooldown sleep ────────────────────────────────────────────────────────
 

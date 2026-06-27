@@ -19,8 +19,8 @@
       "temperature": 0.0
     },
     "evaluator": {
-      "provider": "zai",
-      "model": "glm-4.7",
+      "provider": "anthropic",
+      "model": "claude-opus-4-8",
       "temperature": 1.0
     }
   }

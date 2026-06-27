@@ -27,7 +27,7 @@ def test_get_agent_config_executor():
 
     assert config["role_title"] == "Senior Software Engineer, Data and AI"
     assert "GLOBAL CONSTRAINTS" in config["final_system_prompt"]
-    assert config["model_engine"]["provider"] == "zai"
+    assert config["model_engine"]["provider"]  # non-empty string — don't hardcode
     # Round context is evaluator-only — executor prompt must not contain it
     assert "ROUND CONTEXT" not in config["final_system_prompt"]
 
@@ -39,7 +39,7 @@ def test_get_agent_config_evaluator():
 
     assert config["role_title"] == "Independent Code Quality & Correctness Auditor"
     assert "GLOBAL CONSTRAINTS" in config["final_system_prompt"]
-    assert config["model_engine"]["provider"] == "zai"
+    assert config["model_engine"]["provider"]  # non-empty string — don't hardcode
 
 
 def test_evaluator_prompt_includes_current_round_context():
