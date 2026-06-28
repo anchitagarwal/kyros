@@ -1,0 +1,30 @@
+{
+  "period": {
+    "start": "2026-06-15 09:30:00-04:00",
+    "end": "2026-06-15 17:49:00-04:00"
+  },
+  "total_1m_candles": 500,
+  "gate_blocks": {
+    "no_killzone": 320,
+    "no_htf_bias": 96,
+    "no_dol": 60,
+    "cooldown_active": 23,
+    "no_soft_trigger": 0
+  },
+  "soft_triggers": {
+    "fvg": 1,
+    "ifvg": 0,
+    "sweep": 0,
+    "displacement": 0
+  },
+  "fires_by_killzone": {
+    "london_kz": 0,
+    "ny_am_kz": 1,
+    "ny_pm_kz": 0
+  },
+  "fires_by_month": {
+    "2026-06": 1
+  },
+  "total_fires": 1,
+  "estimated_llm_cost_usd": 0.003
+}

@@ -1,164 +1,156 @@
-# Phase 2 Evaluation — Agentic Reasoning Engine
+# Phase 3A Evaluation Review — Round 3 of 3 (FINAL)
 
-**Round:** 3 of 3 (final allowed round)
-**Evaluator verdict:** APPROVE
-**Method:** Independent audit. Did not accept Executor self-report; re-ran pytest,
-re-derived each invariant, and independently probed R:R override, the tiered
-cooldown, the four hard gates, the alert output, and the round-2 lookahead fix.
+Evaluator: independent grader (did not author this code).
+Verdict basis: all invariants verified independently; `uv run pytest` executed
+by the evaluator (not self-reported).
 
----
-
-## Invariant verification
-
-### (a) Phase 1 detectors READ-ONLY — PASS
-- `git diff --name-only HEAD -- workspace/detectors/` → empty.
-- `git status --short workspace/detectors/` → empty (no uncommitted changes).
-- `detect_session_levels` was added in the committed Phase 1 follow-up
-  (51fdfb6 "Add detect_session_levels"), not by Phase 2. Detector tree is frozen
-  relative to HEAD. No modification.
-
-### (b) detect_session_levels exists + wired into SnapshotBuilder — PASS
-- `workspace/detectors/sessions.py:241` `def detect_session_levels(...)`.
-- Wired in `workspace/trading/snapshot.py:53` (import), `:213` and `:381` (calls).
-- Returns all 15 required keys: midnight_open, true_day_open, london_open,
-  open_830, open_930, asia_high/low, london_high/low, nyam_high/low,
-  nylunch_high/low, nypm_high/low (verified by reading the detector body and by
-  `test_session_levels_all_15_keys_present`).
-
-### (c) call_agentic banned from trading loop — PASS
-- `grep -rn call_agentic workspace/trading/ --include=*.py` → single hit at
-  `reasoning_agent.py:3`, inside a docstring that states "(NEVER `call_agentic`)".
-  No invocation anywhere. The agent uses `model_router.call()` exclusively
-  (`reasoning_agent.py` `reason()`), signature-compatible with
-  `src/kyros/core/model_router.py:193 def call(agent_config, messages, ...)`.
-
-### (d) R:R validator — active, Python-computed, overrides LLM — PASS
-- `workspace/trading/alert.py validate_rr`: recomputes entry_mid from entry_zone,
-  risk = |entry_mid - stop|, rr = |target - entry_mid| / risk, and ALWAYS
-  overwrites `risk_reward` with the Python value.
-- Independent probe (empty API keys):
-  - LLM `risk_reward=5.0`, conviction=90, bias="long", geometry rr=0.5
-    → output `bias="no_trade"`, `no_trade_reason="rr_below_1"`, `risk_reward=0.5`.
-  - risk==0 (entry_mid==stop) → `bias="no_trade"`,
-    `no_trade_reason="degenerate_stop"`, no ZeroDivisionError.
-  - Valid rr=2.0 setup → bias unchanged, risk_reward=2.0.
-- Called BEFORE emit in `trading_loop.py run()`:
-  `alert = agent.reason(...) ; alert = validate_rr(alert) ; ... _emit(...)`.
-
-### (e) TriggerEngine hard gates — each independently enforceable — PASS
-- `trigger.py` evaluates the four hard gates in spec order with short-circuit:
-  killzone → htf_bias → nearest_dol → cooldown; then soft triggers.
-- Tests `test_gate_a/b/c/d` each set the other three gates valid and disable
-  exactly one, asserting `should_trigger False` with the correct reason
-  ("no_killzone" / "no_htf_bias" / "no_dol" / "cooldown_active").
-- `test_gate_ordering_first_failure_wins`: killzone None AND htf_bias None →
-  reason "no_killzone" (first failure). Hard-before-soft ordering correct.
-
-### (f) Tiered cooldown — NOT a flat threshold — PASS
-- `cooldown.py CooldownState.is_cooling_down` uses `snapshot.timestamp`
-  (deterministic, not wall clock). Independent probe:
-  - Tier 1 (no_trade): +4 min → cooling True; +5 min → False.
-  - Tier 2 (directional, same killzone): +30 min → still True.
-  - Tier 3 (directional, different killzone): +1 min → False (allowed).
-  - Fresh state → False.
-- Not a flat timer; killzone-aware for directional alerts. Matches spec.
-
-### (g) MarketSnapshot completeness — PASS
-- `snapshot.py` iterates all 5 TIMEFRAMES (4h,1h,15m,5m,1m); every detector dict
-  (fvgs, ifvgs, order_blocks, breaker_blocks, volume_imbalances, opening_gaps,
-  recent_sweeps, displacements, recent_inducements, po3_phase, recent_swings,
-  premium_discount) gets a key for every TF (empty list when no candles).
-  `test_fvgs_ifvgs_order_blocks_breaker_keys_all_timeframes` asserts the key set
-  equals exactly TIMEFRAMES.
-- `htf_bias_source` populated iff htf_bias not None, with timeframe/type/index/
-  timestamp (`_derive_htf_bias`); 4h-first then 1h fallback.
-- `session_levels` always 15 keys.
-- `all_pools` sorted ascending by distance_points (`_build_pools` sorts; test
-  `test_all_pools_sorted_ascending_by_distance`).
-- `nearest_dol` respects bias: bullish → BSL above price, bearish → SSL below
-  price (`_nearest_dol`; tests `test_nearest_dol_in_correct_bias_direction`,
-  `test_nearest_dol_bearish_below_price`).
-- `to_compact_dict` excludes raw OHLCV (test `test_compact_dict_excludes_raw_candles`;
-  agent test `test_compact_payload_has_no_raw_candles`).
-
-### (h) ICT system prompt — PASS
-Read `ICT_SYSTEM_PROMPT` in `reasoning_agent.py`. Encodes:
-- DOL-first 5-step sequence: enumerate pools → direction from htf_bias → select
-  target → intermediate liquidity check → OTE modifier. ✓
-- Intermediate liquidity check → no_trade ("intermediate liquidity in path"). ✓
-- Unicorn OB↔FVG OVERLAP condition: "OB.top >= FVG.low AND OB.bottom <= FVG.high"
-  (not mere co-presence). ✓
-- 2022 requires all three: sweep + displacement + FVG from that displacement;
-  explicitly states a standalone FVG is NOT a 2022 setup. ✓
-- Silver Bullet time-gated to all three windows: 03:00-04:00 (London),
-  10:00-11:00, 14:00-15:00 ET. London window present. ✓
-- OTE conviction modifier: +15 when entry overlaps OTE band. ✓
-- Output JSON only, no prose/markdown/preamble. ✓
-
-### (i) Offline test suite — PASS
-- `ANTHROPIC_API_KEY="" ZAI_API_KEY="" uv run pytest tests/phase2/` → 101 passed.
-- No test fails for a missing API key. No test calls `model_router` unmocked;
-  `LLMReasoningAgent` tests inject a MagicMock router returning fixture JSON and
-  assert `router.call_agentic.call_count == 0` and exactly one `router.call`.
-
-### (j) Alert output — PASS
-- `trading_loop.py _emit` appends one `json.dumps` line to
-  `workspace/alerts.jsonl` AND prints the same line to stdout.
-- Independent run (sweep_and_fvg, cooldown disabled): 84 JSONL lines emitted,
-  84 stdout lines, first 3 parse as valid JSON with all AlertPayload fields plus
-  timestamp/instrument/current_price. Not DB/Telegram/stdout-only.
-
-### (k) No broker, live data, or order placement — PASS
-- `grep -rni 'ibkr|ib_insync|alpaca|polygon|place_order|submit_order|create_order|market_order'
-  workspace/trading/ --include=*.py` → single hit in `__init__.py:7`, a docstring
-  stating "No broker, no IBKR, no live market data, no order placement." No code.
-
-### Round-2 lookahead fix (ReplayCandleSource) — independently re-verified PASS
-- `candle_source.py` `ReplayCandleSource.next()`: the 1m bar defines `now` at its
-  own (just-closed) open timestamp; higher TFs emit ONLY when
-  `close_dts[cur] <= now_dt` (i.e. bar_open + tf_duration elapsed).
-- Independent probe on a 240-minute monotonic fixture: 0 violations — every
-  emitted higher-TF bar was fully closed by `now`, and no bar's high/low exceeded
-  the running 1m extremes seen up to the decision timestamp. No future price leaks.
+## Test Execution (independent)
+```
+ALPACA_API_KEY="" ANTHROPIC_API_KEY="" ZAI_API_KEY="" uv run pytest tests/phase3a/ -v
+→ 67 passed in 9.43s
+```
+No test failed for a missing API key. DataLoader yfinance/alpaca paths are
+mocked (yfinance not installed → proves no real HTTP). Engine tests mock the
+LLM via `MagicMock(spec=LLMReasoningAgent)`. Invariant (h) satisfied.
 
 ---
 
-## Other observations (no action required)
+## Invariant-by-invariant findings
 
-- `contract.md` is present and describes the round-2 fix; the MEDIUM for a missing
-  contract does NOT apply.
-- No hardcoded secrets in Phase 2 code. `.env` appears only in scripts' docstring
-  usage examples (`uv run --env-file .env ...`), reading from the environment —
-  not writing `.env`, not embedding keys.
-- `scripts/build_golden_dataset.py` treats `alerts_ict.md` strictly as untrusted
-  data (module docstring + parameter docs); router is dependency-injected for
-  mockable tests.
+### (a) Phase 2 / Phase 1 READ-ONLY — PASS
+`git diff --name-only HEAD -- workspace/trading/ workspace/detectors/` → empty.
+No tracked modifications to either tree. New Phase 3A code lives under
+`workspace/backtesting/` and `tests/phase3a/` (untracked). No CRITICAL.
 
-## Pre-existing failure outside Phase 2 scope (not a finding)
+### (b) OutcomeSimulator lookahead safety — PASS (most critical)
+- **Step 1**: `OutcomeSimulator.simulate()` does NOT internally filter
+  `subsequent_candles` by timestamp — per spec the caller owns slicing
+  (outcome.py docstring + body confirm). Acceptable per spec.
+- **Step 2**: `BacktestEngine._slice_subsequent` (engine.py:~230) assembles
+  subsequent candles with strict `if c_dt > alert_dt:` — the alert candle is
+  EXCLUDED. The alert candle is not included. No CRITICAL.
+- **Step 3 (manual probe)** — alert long, entry (100,101), stop 99, target 105,
+  candles T50(alert)..T53:
+  - Including alert candle `[T50,T51,T52,T53]` → result "win", ctf=1, ctr=3.
+    Note: even when the alert candle is wrongly fed in, T50's high=105 does NOT
+    produce an instant win because the fill candle never resolves (resolution
+    begins on the candle AFTER fill). The leak only shifts timing, and the
+    engine never feeds the alert candle anyway.
+  - Correct `[T51,T52,T53]` → "win", ctf=1, ctr=2.
+  Documented; the engine's strict `>` slice is the protective barrier.
+- **Step 4 (ambiguous)**: single post-fill candle with high≥target AND low≤stop
+  → result "loss", actual_rr -1.0. Conservative resolution confirmed.
+- **Step 5 (no_trade short-circuit)**: `alert.bias=="no_trade"` →
+  `TradeOutcome(result="no_trade")` with all numeric fields None, zero candle
+  iteration. Confirmed by probe and code (outcome.py first branch).
 
-`tests/test_agent_loader.py::test_evaluator_prompt_includes_current_round_context`
-fails (asserts "round 1 of 3" appears in the evaluator prompt template in
-`config/prompts.yaml`). This test was introduced in the Phase 1 commit (426b8de),
-the test file was never touched by Phase 2 work, and it concerns the orchestration
-prompt template — not `workspace/trading/` or `tests/phase2/`. It is a genuine
-pre-existing Phase 1 infrastructure issue, out of scope for this evaluation, and
-does not affect the trading pipeline. Flagging for the Phase 1 backlog, not as a
-Phase 2 blocker.
+### (c) TriggerCalibrator is LLM-free — PASS
+`grep model_router|call_agentic|LLMReasoningAgent|anthropic|openai|reason(`
+on calibrator.py → no hits. The calibrator takes `(window, builder, trigger,
+cooldown)` and never constructs or calls an agent. It drives `TriggerEngine`
+directly. `test_no_llm_calls` (LLM mock that raises if called) passes. No CRITICAL.
+
+### (d) BacktestEngine uses Phase 2 CooldownState unchanged — PASS
+Engine reads `cooldown = self.loop.cooldown` (engine.py:127) — the production
+`CooldownState` instance owned by `TradingLoop`. Tests import `CooldownState`
+from `trading.cooldown` and pass it into both `TriggerEngine` and
+`TradingLoop`. No reimplementation. No HIGH.
+
+### (e) Resume idempotent — PASS
+Independent two-run probe (MockCandleSource sweep_and_fvg, n=100, mocked LLM):
+- Run 1: 1 line written, 1 trace returned.
+- Run 2 (same output file): file still 1 line, 1 trace returned.
+- `Idempotent (file not doubled): True`; `No duplicate timestamps: True`.
+`_load_existing` collects processed timestamps; new alerts at already-written
+timestamps are skipped (LLM not re-called); cooldown is replayed from the
+existing alert bias. No CRITICAL.
+
+### (f) PerformanceReport arithmetic — PASS
+Fixture (2 wins 2.0/1.5, 1 loss -1.0, 1 no_trade None) run through
+`PerformanceReport`:
+- win_rate = 0.667 ✓
+- profit_factor = 3.5 ✓
+- expectancy = 0.625 ✓
+- max_drawdown_r = 1.0 ✓
+All four exact. No HIGH.
+
+### (g) LLM contamination disclaimer + prompt hash — PASS
+`grep "optimistically biased"|"training data" workspace/backtest_report.md` →
+present (line 52: "Results may be optimistically biased: the LLM may have seen
+this period in its training data..."). System prompt hash present:
+`**System prompt version:** ` + `b64522da` (first 8 hex of
+`sha256(ICT_SYSTEM_PROMPT)`, imported from READ-ONLY `trading.reasoning_agent`).
+`test_system_prompt_hash_matches_sha256` passes. No MEDIUM.
+
+### (h) Offline test suite — PASS
+All 67 tests pass with all three API keys empty. DataLoader tests mock the
+download helper / use synthetic CSV (no real yfinance/Alpaca HTTP). Engine
+tests mock TradingLoop's agent. No CRITICAL.
+
+### (i) trade_traces.jsonl schema — PASS
+No committed `workspace/trade_traces.jsonl`, so I generated one via an
+integration probe and parsed the first line:
+all required top-level fields present (trace_id, timestamp, instrument,
+killzone, trigger_reason, snapshot_summary, raw_llm_output, alert,
+rr_validated, outcome); outcome contains result, candles_to_fill,
+candles_to_resolution, fill_price, exit_price, actual_rr. No HIGH.
+
+### (j) No broker / live data / order placement — PASS
+`grep -rni "ibkr|ib_insync|place_order|submit_order|create_order"
+workspace/backtesting/` → only documentation/comment strings ("No broker...",
+"never imports a broker/IBKR client"). No actual broker client import or order
+call. The alpaca backend uses `requests.get` for a market-data bars endpoint
+only (read-only, mocked in CI, never exercised this phase). No CRITICAL.
+
+### (k) calibration_report.json keys — PASS
+`workspace/calibration_report.json` parsed; keys present: total_1m_candles,
+gate_blocks, soft_triggers, fires_by_killzone, fires_by_month, total_fires,
+estimated_llm_cost_usd (+ period). Calibrator `_GATE_KEYS` /`_SOFT_KEYS` /
+`_KZ_KEYS` exactly match the production `TriggerEngine` reason vocabulary and
+gate order (verified against trigger.py: no_killzone → no_htf_bias → no_dol →
+cooldown_active → no_soft_trigger; soft fvg/ifvg/sweep/displacement). Gate
+blocks are mutually exclusive per candle (single short-circuit return). No HIGH.
+
+---
+
+## Round-1/Round-2 findings — confirmed addressed
+- M1 (disclaimer LLM-contamination caveat): present.
+- M2 (`backtest_report.md` artifact): committed.
+- L1 (Alpaca env vars in `.env.example`): out-of-scope of this review's
+  invariants; report.py/data_loader read from env, no hardcoded secrets.
+- L2 (cache path backend collision): `_cache_path` includes `{backend}`.
+
+## Documented deviations (acceptable, not defects)
+1. **Expired exit_price/actual_rr = None** (outcome.py) rather than blueprint's
+   "exit_price = close of last in-session candle". Contract D4 pins this
+   explicitly; the report treats None as 0R for expectancy. Internally
+   consistent and disclosed. LOW/none.
+2. **OutcomeSimulator does not raise on `timestamp <= alert.timestamp`**
+   (blueprint suggested a defensive in-component assertion). Per spec/contract
+   D3 this is the caller's responsibility, and `BacktestEngine._slice_subsequent`
+   enforces it with strict `>`. A defensive assertion would be belt-and-suspenders
+   but its absence is explicitly spec-permitted ("If it does filter internally,
+   that's fine too — flag as deviation, not a bug"). LOW.
 
 ---
 
 ## Review Summary
 
-| Severity | Count | Status |
-|----------|-------|--------|
-| CRITICAL | 0     | —      |
-| HIGH     | 0     | —      |
-| MEDIUM   | 0     | —      |
-| LOW      | 0     | —      |
+| Invariant | Result |
+|-----------|--------|
+| (a) Phase 1/2 READ-ONLY | PASS |
+| (b) OutcomeSimulator lookahead safety | PASS |
+| (c) TriggerCalibrator LLM-free | PASS |
+| (d) CooldownState reused unchanged | PASS |
+| (e) Resume idempotent | PASS |
+| (f) PerformanceReport arithmetic | PASS |
+| (g) Disclaimer + prompt hash | PASS |
+| (h) Offline test suite (67 passed) | PASS |
+| (i) trade_traces.jsonl schema | PASS |
+| (j) No broker/live/order | PASS |
+| (k) calibration_report.json keys | PASS |
 
-All Phase 2 invariants (a–k) verified independently and pass. The round-2
-CRITICAL lookahead-bias fix is confirmed correct by independent probe. The
-phase2 test suite runs fully offline (101 passed, no API key required, no
-unmocked router). No CRITICAL or HIGH issues remain.
+No CRITICAL, HIGH, or MEDIUM findings. Two LOW deviations, both explicitly
+spec/contract-sanctioned. All 67 tests pass offline with empty API keys.
 
 VERDICT: APPROVE

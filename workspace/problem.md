@@ -1,111 +1,174 @@
 ## Problem Statement
 
 
-Build the Phase 2 Agentic Reasoning Engine for Project Kyros: a non-stop Python
-trading loop that ingests OHLCV candle data, runs ICT analysis via Phase 1
-detectors, and calls an LLM to produce structured JSON trade alerts when market
-conditions are worth reasoning about.
+Build the Phase 3A Evaluation Harness for Project Kyros: a backtesting engine
+that runs the Phase 2 TradingLoop over historical NQ replay data, calls the LLM
+to produce real AlertPayloads, simulates trade outcomes deterministically against
+subsequent candles, and generates a structured performance report.
 
-The system uses a mock/replay CandleSource for Phase 2 (no live data, no broker).
-The LLM receives a pre-computed MarketSnapshot and outputs an AlertPayload.
-Python validates R:R after every LLM call — alerts below 1:1 become no_trade
-entries in the log.
+Phase 2 is complete and validated (101 tests, APPROVE). workspace/trading/ is
+READ-ONLY — the evaluation harness calls it as a library. The backtest answers
+one question before live deployment: does this system generate tradeable ICT
+setups with positive expectancy?
 
-Key architectural decisions already made:
-- LLM-as-judge: all Phase 1 detectors run upfront, LLM synthesizes
-- TriggerEngine gates LLM calls: killzone + HTF bias + DOL existence + cooldown
-- DOL (draw on liquidity) drives TP, SL, and R:R
-- ICT models the LLM recognizes: 2022, Unicorn, iFVG, Silver Bullet, Breaker
-- Low hanging fruit: if no intermediate unswept liquidity blocks path to DOL
-- Single model_router.call() per trigger — not call_agentic
+The harness has four components:
+
+1. TriggerCalibrator (no LLM) — diagnostic that maps TriggerEngine gate
+   distribution and firing rate over the full historical period without spending
+   API budget. Run this before BacktestEngine to catch miscalibration early.
+
+2. BacktestEngine (LLM in the loop) — drives ReplayCandleSource through
+   historical data, runs the complete TradingLoop including LLM inference,
+   collects AlertPayload per trigger, passes to OutcomeSimulator.
+
+3. OutcomeSimulator (no LLM, deterministic) — given an AlertPayload and
+   subsequent candles, determines win/loss/expired by walking candles forward
+   from alert timestamp. Uses the LLM's entry_zone/stop/target directly — no
+   rules about what these should be. The LLM already decided; the simulator
+   checks whether the market obliged.
+
+4. PerformanceReport — aggregates outcomes into human-readable metrics and
+   writes backtest_report.md. Also produces calibration_report.json from
+   TriggerCalibrator output.
 
 
 ## End Goal
 
 
-A tested, runnable TradingLoop that:
-1. Accepts a CandleSource (MockCandleSource or ReplayCandleSource)
-2. Maintains a CandleWindow per timeframe (4h/1h/15m/5m/1m)
-3. Builds a MarketSnapshot via SnapshotBuilder using Phase 1 detectors
-4. Evaluates TriggerEngine on every new candle
-5. Calls the LLM Reasoning Agent when triggered
-6. Validates R:R (minimum 1:1) post-LLM call
-7. Emits AlertPayload to JSON log file and stdout
+A tested, runnable evaluation harness that:
 
-Full test suite runnable with MockCandleSource — no live data or API keys needed.
+1. TriggerCalibrator.run(source) → CalibrationReport:
+   - Processes full replay period without any LLM calls
+   - Reports fires per killzone, gate block distribution, soft trigger breakdown
+   - Writes workspace/calibration_report.json
+
+2. BacktestEngine.run(source) → list[TradeTrace]:
+   - Drives ReplayCandleSource end-to-end through historical data
+   - Calls TradingLoop (including live LLM inference) per candle
+   - Attaches OutcomeSimulator result to each AlertPayload
+   - Writes each trace as a JSON line to workspace/trade_traces.jsonl
+   - Resumes from last written trace on restart (idempotent)
+
+3. OutcomeSimulator.simulate(alert, subsequent_candles) → TradeOutcome:
+   - Lookahead-safe: uses ONLY candles with timestamp > alert.timestamp
+   - Fill logic: first candle where price enters entry_zone → filled at entry_mid
+   - Win: subsequent candle high >= target (long) or low <= target (short)
+   - Loss: subsequent candle low <= stop (long) or high >= stop (short)
+   - Ambiguous (both in same candle): conservative → loss
+   - Expired: killzone ends with neither hit → no_fill
+
+4. PerformanceReport.generate(traces) → str:
+   - Writes workspace/backtest_report.md
+   - Metrics: total alerts, no_trade rate, win rate, avg R won, avg R lost,
+     profit factor, max drawdown (in R), by model type, by killzone,
+     by timeframe of primary FVG/OB, golden dataset hit rate
+
+Full test suite runnable offline — BacktestEngine tests mock the LLM and
+OutcomeSimulator, TriggerCalibrator tests use MockCandleSource, all Phase 2
+modules are imported from workspace/trading/ as-is (READ-ONLY).
 
 
 ## Constraints
 
 
 HARD CONSTRAINTS:
-- No broker, no IBKR, no order placement, no live data
-- Phase 1 detectors (workspace/detectors/) are READ-ONLY — do not modify
-- Reuse existing ModelRouter, ExecutorToolkit, KyrosAgentLoader
-- Do NOT use call_agentic() for the trading agent — use call() only
-- Python validates R:R post-LLM — never trust LLM arithmetic
-- Alert output: JSON log + stdout only. No Telegram in Phase 2
+- workspace/trading/ is READ-ONLY — import as a library, never modify
+- workspace/detectors/ is READ-ONLY — same rule as Phase 2
+- No broker, no IBKR, no live market data, no order placement
+- All tests must run offline — LLM calls mocked in tests, no API key required
+- OutcomeSimulator MUST NOT use the alert candle itself for outcome resolution
+  (only candles strictly after alert.timestamp); this is a CRITICAL correctness
+  invariant — lookahead here invalidates the entire backtest
 
-ARCHITECTURE:
-Timeframe stack:
-  4h  → 60 candles  (weekly structure, HTF bias)
-  1h  → 100 candles (daily structure, session context)
-  15m → 200 candles (setup timeframe)
-  5m  → 300 candles (entry timeframe)
-  1m  → 500 candles (precision / MSS confirmation)
+MODULE LAYOUT:
+  workspace/backtesting/
+    __init__.py
+    data_loader.py     — load + cache NQ historical data; backends:
+                         yfinance/alpaca (download), csv (local file)
+    calibrator.py      — TriggerCalibrator, CalibrationReport
+    engine.py          — BacktestEngine
+    outcome.py         — OutcomeSimulator, TradeOutcome
+    report.py          — PerformanceReport
 
-TriggerEngine — 4 hard gates (ALL must pass):
-  1. current_killzone is not None
-  2. htf_bias is not None (confirmed BOS/ChoCH on 4h or 1h)
-  3. nearest_dol is not None (unswept opposing pool exists)
-  4. cooldown clear (15 min since last LLM call)
+  workspace/
+    trade_traces.jsonl      — one JSON line per LLM-triggered alert + outcome
+    calibration_report.json — TriggerCalibrator output
+    backtest_report.md      — human-readable PerformanceReport output
 
-TriggerEngine — soft triggers (ANY is sufficient):
-  - Active unmitigated FVG on 5m
-  - iFVG on 5m
-  - Liquidity sweep on 15m in last 10 candles
-  - Displacement on 5m in last 10 candles
-
-DOL logic:
-  - SnapshotBuilder delivers all_pools: all unswept opposing pools across
-    all timeframes, sorted by proximity, with confluence_count
-  - LLM selects target pool from all_pools and explains why in rationale
-  - LLM considers: HTF significance, confluence, whether intermediate
-    pools block path
-  - Python validates selected target gives >= 1:1 R:R
-  - TriggerEngine gate: any unswept opposing pool exists (binary, no threshold)
-
-ICT SYSTEM PROMPT:
-  - LLM identifies which model applies per alert:
-      2022     → AMD structure: sweep → displacement → FVG retracement
-      unicorn  → BOS displacement FVG + OB at same level
-      ifvg     → filled FVG now acting as opposing S/R
-      silver_bullet → 10:00-11:00 ET or 14:00-15:00 ET displacement FVG
-      breaker  → failed OB flipped to opposing S/R
-      none     → no_trade
-  - DOL-first reasoning: enumerate all unswept pools, target nearest in bias
-    direction after sweep. If intermediate unswept pool exists between entry
-    and DOL, output no_trade with reason "intermediate liquidity in path"
-  - Output structured JSON only — no prose outside the JSON block
-
-ALERT OUTPUT SCHEMA:
+TRADE TRACE SCHEMA (one JSON line per trace in trade_traces.jsonl):
 {
-  "bias":           "long | short | no_trade",
-  "model":          "2022 | unicorn | ifvg | silver_bullet | breaker | none",
-  "conviction":     0-100,
-  "entry_zone":     [float, float],
-  "stop":           float,
-  "target":         float,
-  "dol": {
-    "level":        float,
-    "type":         str,
-    "timeframe":    str
-  },
-  "risk_reward":    float,
-  "rationale":      str,
-  "killzone":       str,
-  "valid_until":    str,
-  "no_trade_reason": str | null
+  "trace_id":         str,          // uuid4
+  "timestamp":        str,          // ISO — when alert fired
+  "instrument":       "NQ",
+  "killzone":         str,
+  "trigger_reason":   str,          // which soft trigger fired
+  "snapshot_summary": dict,         // compact snapshot — no raw candles
+  "raw_llm_output":   str,          // raw string returned by model_router.call()
+  "alert":            dict,         // AlertPayload as dict
+  "rr_validated":     bool,         // did Python R:R validator run?
+  "outcome": {
+    "result":                "win" | "loss" | "expired" | "no_fill" | "no_trade",
+    "candles_to_fill":       int | null,
+    "candles_to_resolution": int | null,
+    "fill_price":            float | null,
+    "exit_price":            float | null,
+    "actual_rr":             float | null   // realized R, negative for loss
+  }
 }
 
-INSTRUMENT: NQ only (/NQ=F) for Phase 2
+CALIBRATION REPORT SCHEMA (workspace/calibration_report.json):
+{
+  "period":           {"start": str, "end": str},
+  "total_1m_candles": int,
+  "gate_blocks": {
+    "no_killzone":    int,
+    "no_htf_bias":    int,
+    "no_dol":         int,
+    "cooldown_active": int
+  },
+  "soft_triggers": {
+    "active_fvg":     int,
+    "ifvg":           int,
+    "sweep":          int,
+    "displacement":   int
+  },
+  "fires_by_killzone": {"london_kz": int, "ny_am_kz": int, "ny_pm_kz": int},
+  "fires_by_month":    {"2024-01": int, ...},
+  "total_fires":       int,
+  "estimated_llm_cost_usd": float
+}
+
+DATA LOADER:
+  DataLoader supports three backends (configured via env var KYROS_DATA_BACKEND):
+    "yfinance"  — downloads /NQ=F in 7-day 1m chunks, stitches, caches to parquet
+                  Use for dev/recent data testing only
+    "alpaca"    — uses Alpaca Markets API (ALPACA_API_KEY, ALPACA_SECRET_KEY env vars)
+                  for 1m NQ futures data up to 5 years back
+                  Use for full historical backtest
+    "csv"       — local 1m CSV exported offline by an external tool (path via
+                  KYROS_CSV_PATH, default workspace/data/nq_1min_data.csv).
+                  Columns: date (UTC), open, high, low, close, volume; extra columns
+                  (e.g. contract) are ignored. Normalizes date→timestamp (UTC),
+                  filters to [start, end], caches to the same parquet format.
+                  No network access — never imports a broker/IBKR client.
+  BacktestEngine and TriggerCalibrator consume cached parquet — never re-download
+
+  Active for this phase: KYROS_DATA_BACKEND=csv → workspace/data/nq_1min_data.csv
+  (1m bars, 2024-06-09 → present, exported offline from TWS). Base timeframe stays
+  1m — ReplayCandleSource in workspace/trading/ is used as-is (READ-ONLY, no edits).
+
+PERFORMANCE REPORT must include:
+  - LLM contamination disclaimer: "Backtest results may be optimistically biased.
+    The LLM's training data includes market commentary from the backtest period.
+    Treat metrics as directional signal for comparing system versions, not as
+    prediction of live performance."
+  - System prompt hash (first 8 chars of sha256 of ICT_SYSTEM_PROMPT) for
+    version tracking — allows comparison across prompt iterations
+
+BACKTESTING VALIDITY:
+  - BacktestEngine must pass the same cooldown logic as production TradingLoop
+    (tiered CooldownState from workspace/trading/cooldown.py)
+  - No look-ahead: ReplayCandleSource in workspace/trading/candle_source.py
+    already enforces this — BacktestEngine must not bypass it
+  - resume_from argument: BacktestEngine reads existing trade_traces.jsonl
+    and skips already-processed timestamps on restart
