@@ -16,11 +16,11 @@ identically to the first run — no LLM re-call is needed for resumed alerts.
 
 Replay buffer
 -------------
-The engine maintains a replay buffer of 1m candles (all candles processed,
-which is ≥480 for any meaningful backtest — enough to resolve intraday
-outcomes over 8 hours). When an alert fires, the engine slices subsequent
-candles (strictly AFTER the alert timestamp) from this buffer and passes them
-to OutcomeSimulator. These subsequent candles are NEVER visible to the
+The engine accumulates every processed 1m candle into a replay buffer (so it
+grows to the full dataset). After replay, each deferred alert slices the
+candles strictly AFTER its timestamp — located via bisect over the buffer's
+chronological timestamps and capped at _MAX_LOOKAHEAD — and passes them to
+OutcomeSimulator. These subsequent candles are NEVER visible to the
 TradingLoop — they are purely for outcome resolution (the one allowed forward
 read, isolated to OutcomeSimulator after the alert is produced).
 
@@ -30,6 +30,7 @@ only network dependency and is mocked in tests.
 
 from __future__ import annotations
 
+import bisect
 import json
 import uuid
 from dataclasses import dataclass, field
@@ -43,6 +44,11 @@ __all__ = ["TradeTrace", "BacktestEngine"]
 
 # Minimum replay buffer size (1m candles) — 8 hours of intraday data.
 _MIN_BUFFER = 480
+
+# Max candles examined per alert during outcome resolution. Every alert resolves
+# within its killzone (same trading day), so two trading days of 1m bars is always
+# enough; the cap bounds resolution at O(_MAX_LOOKAHEAD) instead of O(n) per alert.
+_MAX_LOOKAHEAD = 2880
 
 
 @dataclass
@@ -169,9 +175,13 @@ class BacktestEngine:
             deferred.append((alert, snapshot, result.reason, raw_llm_output))
 
         # ── Resolve deferred alerts ─────────────────────────────────────────
+        # Parse candle timestamps once (chronological → sorted) so each alert
+        # uses an O(log n) bisect instead of a full scan of the buffer.
+        buffer_ts = [_parse_ts(c["timestamp"]) for c in replay_buffer]
+
         new_traces: list[TradeTrace] = []
         for alert, snapshot, trigger_reason, raw_llm_output in deferred:
-            subsequent = self._slice_subsequent(replay_buffer, snapshot.timestamp)
+            subsequent = self._slice_subsequent(replay_buffer, buffer_ts, snapshot.timestamp)
             outcome = self.simulator.simulate(alert, subsequent)
             trace = self._build_trace(alert, snapshot, trigger_reason, raw_llm_output, outcome)
             new_traces.append(trace)
@@ -243,20 +253,23 @@ class BacktestEngine:
     # ── subsequent candle slicing ───────────────────────────────────────────
 
     @staticmethod
-    def _slice_subsequent(replay_buffer: list[dict], alert_ts) -> list[dict]:
-        """Return candles from replay_buffer strictly AFTER alert_ts.
+    def _slice_subsequent(replay_buffer: list[dict], buffer_ts: list[datetime],
+                          alert_ts) -> list[dict]:
+        """Return up to _MAX_LOOKAHEAD candles strictly AFTER alert_ts.
 
-        CRITICAL: only candles with timestamp > alert_ts are returned. The
-        alert candle itself is excluded — using it would leak the alert bar's
-        high/low into outcome resolution (lookahead bias).
+        ``buffer_ts`` holds the parsed candle timestamps in the same order as
+        ``replay_buffer`` (chronological → sorted). ``bisect_right`` finds the
+        first index strictly greater than the alert timestamp, so the alert
+        candle itself is excluded — using it would leak the alert bar's
+        high/low into outcome resolution (lookahead bias). The slice is capped
+        at _MAX_LOOKAHEAD: every alert resolves within its killzone, so two
+        trading days of bars always suffice, and the cap keeps resolution
+        O(_MAX_LOOKAHEAD) rather than copying the whole tail per alert.
         """
         alert_dt = _parse_ts(alert_ts)
-        subsequent = []
-        for candle in replay_buffer:
-            c_dt = _parse_ts(candle["timestamp"])
-            if c_dt > alert_dt:
-                subsequent.append(candle)
-        return subsequent
+        lo = bisect.bisect_right(buffer_ts, alert_dt)
+        hi = min(lo + _MAX_LOOKAHEAD, len(replay_buffer))
+        return replay_buffer[lo:hi]
 
     # ── trace building ──────────────────────────────────────────────────────
 

@@ -7,6 +7,7 @@ is a pure function of (alert, candles): no I/O, no clock, no LLM.
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -142,6 +143,43 @@ def test_short_loss():
     assert out.actual_rr == pytest.approx(-1.0)
 
 
+# ── Realized gap-through-stop losses ──────────────────────────────────────────
+
+
+def test_long_loss_gap_through_stop():
+    """Long loss: a candle that gaps below the stop fills at the open (< -1R)."""
+    alert = _long_alert()  # entry_mid=101, stop=95, risk=6
+    candles = [
+        _candle(_BASE + timedelta(minutes=1), 100, 103, 98, 101),  # fill
+        _candle(_BASE + timedelta(minutes=2), 90, 92, 88, 89),     # gap below stop 95
+    ]
+    sim = OutcomeSimulator()
+    out = sim.simulate(alert, candles)
+    assert out.result == "loss"
+    # Realized exit is the gap open (90), not the nominal stop (95).
+    assert out.exit_price == 90.0
+    # actual_rr = (90 - 101) / 6 = -11/6 ≈ -1.83
+    assert out.actual_rr == pytest.approx(-11 / 6)
+    assert out.actual_rr < -1.0
+
+
+def test_short_loss_gap_through_stop():
+    """Short loss: a candle that gaps above the stop fills at the open (< -1R)."""
+    alert = _short_alert()  # entry_mid=101, stop=110, risk=9
+    candles = [
+        _candle(_BASE + timedelta(minutes=1), 102, 103, 98, 100),    # fill
+        _candle(_BASE + timedelta(minutes=2), 115, 117, 113, 116),   # gap above stop 110
+    ]
+    sim = OutcomeSimulator()
+    out = sim.simulate(alert, candles)
+    assert out.result == "loss"
+    # Realized exit is the gap open (115), not the nominal stop (110).
+    assert out.exit_price == 115.0
+    # actual_rr = (101 - 115) / 9 = -14/9 ≈ -1.56
+    assert out.actual_rr == pytest.approx(-14 / 9)
+    assert out.actual_rr < -1.0
+
+
 # ── Ambiguous (same candle hits both) ─────────────────────────────────────────
 
 
@@ -219,6 +257,32 @@ def test_no_fill_ran_out_of_candles():
     out = sim.simulate(alert, candles)
     assert out.result == "no_fill"
     assert out.actual_rr is None
+
+
+# ── Naive valid_until (timezone robustness) ───────────────────────────────────
+
+
+def test_naive_valid_until_does_not_crash():
+    """A naive valid_until must not crash against tz-aware candle timestamps.
+
+    Production: candles arrive tz-aware ET and the LLM-produced valid_until may
+    be a naive ISO string. The simulator coerces naive → ET before comparing,
+    so the comparison never raises "offset-naive vs offset-aware".
+    """
+    ny = ZoneInfo("America/New_York")
+    base_et = datetime(2026, 6, 15, 10, 0, tzinfo=ny)
+    # Naive valid_until at 10:03 ET (no offset in the string).
+    vu_naive = datetime(2026, 6, 15, 10, 3).isoformat()  # "2026-06-15T10:03:00"
+    alert = _long_alert(valid_until=vu_naive)
+    candles = [
+        _candle(base_et + timedelta(minutes=1), 100, 103, 98, 101),   # fill (10:01 ET)
+        _candle(base_et + timedelta(minutes=2), 101, 105, 99, 103),   # no hit (10:02 ET)
+        _candle(base_et + timedelta(minutes=3), 103, 106, 100, 104),  # 10:03 ET ≥ valid_until
+    ]
+    sim = OutcomeSimulator()
+    out = sim.simulate(alert, candles)  # must not raise
+    assert out.result == "expired"
+    assert out.fill_price == 101.0
 
 
 # ── Expired ───────────────────────────────────────────────────────────────────

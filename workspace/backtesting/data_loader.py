@@ -124,8 +124,9 @@ class DataLoader:
         import pandas as pd
 
         if len(df) == 0:
-            # Empty frame — still coerce column order/dtypes.
-            return pd.DataFrame(columns=CANONICAL_COLUMNS).astype(
+            # Empty frame — still coerce column order/dtypes, including a
+            # tz-aware datetime64[ns, UTC] timestamp per the canonical schema.
+            empty = pd.DataFrame(columns=CANONICAL_COLUMNS).astype(
                 {
                     "open": "float64",
                     "high": "float64",
@@ -134,6 +135,8 @@ class DataLoader:
                     "volume": "int64",
                 }
             )
+            empty["timestamp"] = pd.to_datetime(empty["timestamp"], utc=True)
+            return empty
 
         # Ensure timestamp is tz-aware UTC.
         ts = pd.to_datetime(df["timestamp"], utc=True)
@@ -253,74 +256,13 @@ class DataLoader:
     # ── alpaca backend ──────────────────────────────────────────────────────
 
     def _load_alpaca(self, start: str, end: str):
-        """Page Alpaca Markets v2 bars for NQ futures, write canonical parquet.
+        """Alpaca backend — not implemented for NQ futures.
 
-        Uses ALPACA_API_KEY / ALPACA_SECRET_KEY from env (never hardcoded).
-        This path is NEVER exercised in CI (no network). Tests mock requests.
+        Alpaca has no bars endpoint we can rely on for NQ index futures, and
+        this path is never exercised offline. Fail loudly so a misconfigured
+        KYROS_DATA_BACKEND surfaces immediately at load() time instead of
+        silently returning wrong/empty data. Use the 'csv' backend.
         """
-        import pandas as pd
-
-        api_key = os.getenv("ALPACA_API_KEY", "")
-        secret_key = os.getenv("ALPACA_SECRET_KEY", "")
-        start_dt, end_exclusive = _parse_date_range(start, end)
-
-        frames = []
-        next_token = None
-        while True:
-            page, next_token = self._fetch_alpaca_page(
-                start_dt, end_exclusive, api_key, secret_key, next_token
-            )
-            if page is not None and len(page) > 0:
-                frames.append(page)
-            if next_token is None:
-                break
-
-        if not frames:
-            return pd.DataFrame(columns=CANONICAL_COLUMNS)
-
-        df = pd.concat(frames, ignore_index=True)
-        return df
-
-    def _fetch_alpaca_page(self, start, end, api_key, secret_key, page_token):
-        """Fetch one page of Alpaca v2 bars. Returns (DataFrame, next_token)."""
-        import pandas as pd
-        import requests
-
-        url = "https://data.alpaca.markets/v1beta3/crypto/us/bars"
-        # Alpaca crypto/futures bars endpoint; NQ futures use the options/futures
-        # data plane. This is a best-effort implementation for completeness —
-        # the csv backend is the active path this phase.
-        headers = {
-            "APCA-API-KEY-ID": api_key,
-            "APCA-API-SECRET-KEY": secret_key,
-        }
-        params = {
-            "symbols": "NQ",
-            "timeframe": "1Min",
-            "start": start.isoformat(),
-            "end": end.isoformat(),
-        }
-        if page_token is not None:
-            params["page_token"] = page_token
-
-        resp = requests.get(url, headers=headers, params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-
-        bars = data.get("bars", {}).get("NQ", [])
-        next_token = data.get("next_page_token")
-
-        if not bars:
-            return pd.DataFrame(columns=CANONICAL_COLUMNS), next_token
-
-        df = pd.DataFrame(
-            {
-                "timestamp": pd.to_datetime([b["t"] for b in bars], utc=True),
-                "open": [float(b["o"]) for b in bars],
-                "high": [float(b["h"]) for b in bars],
-                "low": [float(b["l"]) for b in bars],
-                "close": [float(b["c"]) for b in bars],
-                "volume": [int(b.get("v", 0)) for b in bars],
-            }
+        raise NotImplementedError(
+            "alpaca backend not implemented for NQ futures; use the 'csv' backend"
         )
-        return df, next_token

@@ -33,10 +33,10 @@ actual_rr
 ---------
 - Win:  (exit_price - fill_price) / abs(fill_price - stop) for long;
         (fill_price - exit_price) / abs(fill_price - stop) for short.
-        exit_price = alert.target.
-- Loss: negative of the same formula. exit_price = alert.stop (a clean
-        stop-out gives exactly -1.0; a gap-through-stop gives worse than -1.0
-        — realized, not nominal).
+        exit_price = alert.target (nominal — wins never assume better-than-target fills).
+- Loss: negative of the same formula. exit_price is the REALIZED stop-out: a
+        clean intrabar stop fills at alert.stop (exactly -1.0); a gap through
+        the stop fills at the candle open (worse than -1.0).
 - no_fill / no_trade / expired → None.
 
 Pure function of (alert, candles): no I/O, no clock, no randomness, no LLM.
@@ -45,8 +45,9 @@ Pure function of (alert, candles): no I/O, no clock, no randomness, no LLM.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 __all__ = ["TradeOutcome", "OutcomeSimulator"]
 
@@ -63,7 +64,7 @@ class TradeOutcome:
             resolution (None if not resolved).
         fill_price: the entry_mid at which the trade filled (None if no fill).
         exit_price: the price at which the trade resolved (target for win,
-            stop for loss; None if not resolved).
+            realized stop for loss; None if not resolved).
         actual_rr: realized risk-reward (positive for win, negative for loss;
             None for no_fill / no_trade / expired).
     """
@@ -87,11 +88,24 @@ class TradeOutcome:
 
 
 def _parse_ts(ts: Any) -> datetime:
-    """Parse a timestamp (datetime or ISO-8601 str) to an aware datetime."""
+    """Parse a timestamp (datetime or ISO-8601 str) to a datetime (maybe naive)."""
     if isinstance(ts, datetime):
         return ts
     dt = datetime.fromisoformat(str(ts))
     return dt
+
+
+# Project display timezone. Candle timestamps arrive tz-aware ET; an LLM-produced
+# valid_until may be naive — interpret naive datetimes as ET (the framing the LLM is
+# given) before comparing, so aware and naive values never collide.
+_NY = ZoneInfo("America/New_York")
+
+
+def _to_utc(dt: datetime) -> datetime:
+    """Coerce a datetime to aware UTC; naive inputs are assumed to be ET."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_NY)
+    return dt.astimezone(timezone.utc)
 
 
 class OutcomeSimulator:
@@ -130,7 +144,7 @@ class OutcomeSimulator:
             # valid_until and we haven't filled, it's no_fill.
             if valid_until_dt is not None:
                 c_ts = _parse_ts(candle["timestamp"])
-                if c_ts >= valid_until_dt:
+                if _to_utc(c_ts) >= _to_utc(valid_until_dt):
                     return TradeOutcome(result="no_fill")
 
             c_low = float(candle["low"])
@@ -160,7 +174,7 @@ class OutcomeSimulator:
 
             # Killzone expiry check: if this candle is at/after valid_until
             # and we haven't resolved, it's expired.
-            if valid_until_dt is not None and c_ts >= valid_until_dt:
+            if valid_until_dt is not None and _to_utc(c_ts) >= _to_utc(valid_until_dt):
                 return TradeOutcome(
                     result="expired",
                     candles_to_fill=candles_to_fill,
@@ -182,7 +196,7 @@ class OutcomeSimulator:
 
             if win and loss:
                 # Ambiguous: both hit in the same candle → loss (conservative).
-                exit_price = stop
+                exit_price = self._realized_loss_exit(is_long, stop, float(candle["open"]))
                 actual_rr = self._compute_rr(alert.bias, fill_price, exit_price, stop, risk)
                 return TradeOutcome(
                     result="loss",
@@ -204,7 +218,7 @@ class OutcomeSimulator:
                     actual_rr=actual_rr,
                 )
             if loss:
-                exit_price = stop
+                exit_price = self._realized_loss_exit(is_long, stop, float(candle["open"]))
                 actual_rr = self._compute_rr(alert.bias, fill_price, exit_price, stop, risk)
                 return TradeOutcome(
                     result="loss",
@@ -237,6 +251,18 @@ class OutcomeSimulator:
             return _parse_ts(valid_until)
         except (ValueError, TypeError):
             return None
+
+    @staticmethod
+    def _realized_loss_exit(is_long: bool, stop: float, candle_open: float) -> float:
+        """Realized stop-out price for a losing candle.
+
+        A clean intrabar stop fills at ``stop`` (exactly -1.0R). A gap through
+        the stop (the candle opens beyond it) fills at the open, giving a loss
+        worse than -1.0R. Long fills at min(stop, open); short at max(stop, open).
+        """
+        if is_long:
+            return min(stop, candle_open)
+        return max(stop, candle_open)
 
     @staticmethod
     def _compute_rr(bias: str, fill_price: float, exit_price: float,

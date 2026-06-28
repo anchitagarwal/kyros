@@ -305,3 +305,27 @@ def test_default_backend_from_env(tmp_path, monkeypatch):
 def test_unknown_backend_raises():
     with pytest.raises(ValueError):
         DataLoader(backend="bogus")
+
+
+# ── alpaca backend (fail-loud) ────────────────────────────────────────────────
+
+
+def test_alpaca_backend_not_implemented(tmp_path, monkeypatch):
+    """The alpaca backend fails loudly (NotImplementedError) at load() time."""
+    import backtesting.data_loader as dl_mod
+
+    monkeypatch.setattr(dl_mod, "_CACHE_DIR", tmp_path / "cache")
+    loader = DataLoader(backend="alpaca")  # accepted name...
+    with pytest.raises(NotImplementedError):
+        loader.load("2024-06-10", "2024-06-10")  # ...but unusable, surfaced here
+
+
+# ── _normalize empty frame ────────────────────────────────────────────────────
+
+
+def test_normalize_empty_frame_has_utc_timestamp_dtype():
+    """An empty result still carries a tz-aware datetime64[ns, UTC] timestamp."""
+    empty = DataLoader._normalize(pd.DataFrame(), "2024-06-10", "2024-06-10")
+    assert list(empty.columns) == CANONICAL_COLUMNS
+    assert len(empty) == 0
+    assert str(empty["timestamp"].dt.tz) == "UTC"
