@@ -1,0 +1,62 @@
+2026-06-29 15:42:04,282 INFO    kyros.backtest | Logging to /Users/anchit/src/kyros/workspace/logs/backtest_20260629_154204.log
+2026-06-29 15:42:04,283 INFO    kyros.backtest | Kyros Phase 3A backtest runner
+2026-06-29 15:42:04,283 INFO    kyros.backtest | repo root  : /Users/anchit/src/kyros
+2026-06-29 15:42:04,283 INFO    kyros.backtest | date range : 2026-06-01 → 2026-06-04 (inclusive)
+2026-06-29 15:42:04,283 INFO    kyros.backtest | data backend: csv
+2026-06-29 15:42:04,283 INFO    kyros.backtest | csv path   : workspace/data/nq_1min_data.csv
+2026-06-29 15:42:04,283 INFO    kyros.backtest | Loading NQ 1m data...
+2026-06-29 15:42:04,283 INFO    kyros.backtest | Data ready in 0.0s → workspace/data/NQ_1m_2026-06-01_2026-06-04_csv.parquet
+2026-06-29 15:42:04,708 WARNING py.warnings | /Users/anchit/src/kyros/scripts/run_backtest.py:353: UserWarning: ReplayCandleSource: 4 non-contiguous 1m gap(s) detected in 5520 bars. Higher-TF resampling will produce sparse bars across these gaps. First gap(s): 2026-06-01 16:59:00-04:00 → 2026-06-01 18:00:00-04:00 (0 days 01:01:00); 2026-06-02 16:59:00-04:00 → 2026-06-02 18:00:00-04:00 (0 days 01:01:00); 2026-06-03 16:59:00-04:00 → 2026-06-03 18:00:00-04:00 (0 days 01:01:00); ...
+  cal = run_calibration(ReplayCandleSource(str(data_path), validate_gaps=True), progress)
+
+2026-06-29 15:42:04,918 INFO    kyros.backtest | ── Stage 1: trigger calibration (no LLM) ──
+2026-06-29 16:40:14,473 INFO    kyros.backtest | Calibration finished in 302.9s → workspace/calibration_report.json
+2026-06-29 16:40:14,473 INFO    kyros.backtest |   period               : 2026-05-31 20:00:00-04:00 → 2026-06-04 19:58:00-04:00
+2026-06-29 16:40:14,473 INFO    kyros.backtest |   1m candles evaluated : 5,519
+2026-06-29 16:40:14,473 INFO    kyros.backtest |   trigger fires        : 11
+2026-06-29 16:40:14,473 INFO    kyros.backtest |   est. LLM cost        : ~$0.03
+2026-06-29 16:40:14,473 INFO    kyros.backtest |   gate blocks (first failing gate per candle):
+2026-06-29 16:40:14,473 INFO    kyros.backtest |     no_killzone           4,079  (73.9%)
+2026-06-29 16:40:14,473 INFO    kyros.backtest |     no_htf_bias             210  ( 3.8%)
+2026-06-29 16:40:14,473 INFO    kyros.backtest |     no_dol                    1  ( 0.0%)
+2026-06-29 16:40:14,473 INFO    kyros.backtest |     cooldown_active       1,218  (22.1%)
+2026-06-29 16:40:14,473 INFO    kyros.backtest |     no_soft_trigger           0  ( 0.0%)
+2026-06-29 16:40:14,473 INFO    kyros.backtest |   soft triggers fired:
+2026-06-29 16:40:14,473 INFO    kyros.backtest |     fvg                      11
+2026-06-29 16:40:14,473 INFO    kyros.backtest |     ifvg                      0
+2026-06-29 16:40:14,473 INFO    kyros.backtest |     sweep                     0
+2026-06-29 16:40:14,473 INFO    kyros.backtest |     displacement              0
+2026-06-29 16:40:14,473 INFO    kyros.backtest |   fires by killzone:
+2026-06-29 16:40:14,473 INFO    kyros.backtest |     london_kz                 3
+2026-06-29 16:40:14,473 INFO    kyros.backtest |     ny_am_kz                  4
+2026-06-29 16:40:14,473 INFO    kyros.backtest |     ny_pm_kz                  4
+2026-06-29 16:40:14,475 INFO    kyros.backtest | reasoning model: anthropic/claude-opus-4-8 (temp=1.0)
+2026-06-29 16:40:14,688 INFO    kyros.backtest | ── Stage 2: backtest engine (LLM in loop) ──
+2026-06-29 16:40:14,694 INFO    kyros.backtest | Found 179 existing alerts in trade_alerts.jsonl — those timestamps will be skipped (resume; no re-spend).
+2026-06-29 16:40:14,694 WARNING kyros.backtest | Existing alerts are INCLUDED in the report. To start clean, archive the ledger first (see --help).
+2026-06-29 17:09:22,270 INFO    kyros.backtest | Backtest finished in 318.5s (5.3 min). 179 total traces → /Users/anchit/src/kyros/workspace/trade_traces.jsonl
+2026-06-29 17:09:22,270 INFO    kyros.backtest | ── Stage 3: performance report ──
+2026-06-29 17:09:22,275 INFO    kyros.backtest | Report written → /Users/anchit/src/kyros/workspace/backtest_report.md
+2026-06-29 17:09:22,275 INFO    kyros.backtest |   **System prompt version:** `b64522da`
+2026-06-29 17:09:22,275 INFO    kyros.backtest |   ## Overall Metrics
+2026-06-29 17:09:22,275 INFO    kyros.backtest |   - Total traces: 179
+2026-06-29 17:09:22,275 INFO    kyros.backtest |   - No-trade rate: 96.6% (173)
+2026-06-29 17:09:22,275 INFO    kyros.backtest |   - Actionable alerts: 6
+2026-06-29 17:09:22,275 INFO    kyros.backtest |   - Fill rate (filled / actionable): 83.3% (5/6)
+2026-06-29 17:09:22,275 INFO    kyros.backtest |   - Win rate (of filled): 20.0% (1)
+2026-06-29 17:09:22,275 INFO    kyros.backtest |   - Loss rate (of filled): 20.0% (1)
+2026-06-29 17:09:22,275 INFO    kyros.backtest |   - Expired rate (of filled): 60.0% (3)
+2026-06-29 17:09:22,275 INFO    kyros.backtest |   - Cancelled (target/stop hit before entry): 1
+2026-06-29 17:09:22,275 INFO    kyros.backtest |   - Avg winning R: 2.41
+2026-06-29 17:09:22,275 INFO    kyros.backtest |   - Avg losing R: -1.00
+2026-06-29 17:09:22,275 INFO    kyros.backtest |   - Profit factor: 2.41
+2026-06-29 17:09:22,275 INFO    kyros.backtest |   - Max drawdown (R): 1.00
+2026-06-29 17:09:22,275 INFO    kyros.backtest |   - Expectancy per trade (R): 0.0079
+2026-06-29 17:09:22,276 INFO    kyros.backtest |   ## By Model Type
+2026-06-29 17:09:22,276 INFO    kyros.backtest |   ## By Killzone
+2026-06-29 17:09:22,276 INFO    kyros.backtest |   ## By Month
+2026-06-29 17:09:22,276 INFO    kyros.backtest |   ## Golden Dataset Match
+2026-06-29 17:09:22,276 INFO    kyros.backtest |   - Total directional golden entries (within backtest window): 3
+2026-06-29 17:09:22,276 INFO    kyros.backtest |   - Matched (within ±15 min, same direction): 0
+2026-06-29 17:09:22,276 INFO    kyros.backtest |   - Match rate: 0.0%
+2026-06-29 17:09:22,282 INFO    kyros.backtest | Done.

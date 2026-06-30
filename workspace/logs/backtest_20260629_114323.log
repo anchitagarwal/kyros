@@ -1,0 +1,156 @@
+2026-06-29 11:43:23,367 INFO    kyros.backtest | Logging to /Users/anchit/src/kyros/workspace/logs/backtest_20260629_114323.log
+2026-06-29 11:43:23,367 INFO    kyros.backtest | Kyros Phase 3A backtest runner
+2026-06-29 11:43:23,367 INFO    kyros.backtest | repo root  : /Users/anchit/src/kyros
+2026-06-29 11:43:23,367 INFO    kyros.backtest | date range : 2026-06-01 → 2026-06-04 (inclusive)
+2026-06-29 11:43:23,367 INFO    kyros.backtest | data backend: csv
+2026-06-29 11:43:23,367 INFO    kyros.backtest | csv path   : workspace/data/nq_1min_data.csv
+2026-06-29 11:43:23,367 INFO    kyros.backtest | Loading NQ 1m data...
+2026-06-29 11:43:24,795 INFO    kyros.backtest | Data ready in 1.4s → workspace/data/NQ_1m_2026-06-01_2026-06-04_csv.parquet
+2026-06-29 11:43:24,890 WARNING py.warnings | /Users/anchit/src/kyros/scripts/run_backtest.py:353: UserWarning: ReplayCandleSource: 4 non-contiguous 1m gap(s) detected in 5520 bars. Higher-TF resampling will produce sparse bars across these gaps. First gap(s): 2026-06-01 16:59:00-04:00 → 2026-06-01 18:00:00-04:00 (0 days 01:01:00); 2026-06-02 16:59:00-04:00 → 2026-06-02 18:00:00-04:00 (0 days 01:01:00); 2026-06-03 16:59:00-04:00 → 2026-06-03 18:00:00-04:00 (0 days 01:01:00); ...
+  cal = run_calibration(ReplayCandleSource(str(data_path), validate_gaps=True), progress)
+
+2026-06-29 11:43:25,106 INFO    kyros.backtest | ── Stage 1: trigger calibration (no LLM) ──
+2026-06-29 11:48:30,981 INFO    kyros.backtest | Calibration finished in 305.9s → workspace/calibration_report.json
+2026-06-29 11:48:30,981 INFO    kyros.backtest |   period               : 2026-05-31 20:00:00-04:00 → 2026-06-04 19:58:00-04:00
+2026-06-29 11:48:30,981 INFO    kyros.backtest |   1m candles evaluated : 5,519
+2026-06-29 11:48:30,981 INFO    kyros.backtest |   trigger fires        : 11
+2026-06-29 11:48:30,981 INFO    kyros.backtest |   est. LLM cost        : ~$0.03
+2026-06-29 11:48:30,981 INFO    kyros.backtest |   gate blocks (first failing gate per candle):
+2026-06-29 11:48:30,981 INFO    kyros.backtest |     no_killzone           4,079  (73.9%)
+2026-06-29 11:48:30,981 INFO    kyros.backtest |     no_htf_bias             210  ( 3.8%)
+2026-06-29 11:48:30,981 INFO    kyros.backtest |     no_dol                    1  ( 0.0%)
+2026-06-29 11:48:30,981 INFO    kyros.backtest |     cooldown_active       1,218  (22.1%)
+2026-06-29 11:48:30,981 INFO    kyros.backtest |     no_soft_trigger           0  ( 0.0%)
+2026-06-29 11:48:30,981 INFO    kyros.backtest |   soft triggers fired:
+2026-06-29 11:48:30,981 INFO    kyros.backtest |     fvg                      11
+2026-06-29 11:48:30,981 INFO    kyros.backtest |     ifvg                      0
+2026-06-29 11:48:30,981 INFO    kyros.backtest |     sweep                     0
+2026-06-29 11:48:30,981 INFO    kyros.backtest |     displacement              0
+2026-06-29 11:48:30,981 INFO    kyros.backtest |   fires by killzone:
+2026-06-29 11:48:30,981 INFO    kyros.backtest |     london_kz                 3
+2026-06-29 11:48:30,982 INFO    kyros.backtest |     ny_am_kz                  4
+2026-06-29 11:48:30,982 INFO    kyros.backtest |     ny_pm_kz                  4
+2026-06-29 11:48:30,985 INFO    kyros.backtest | reasoning model: anthropic/claude-opus-4-8 (temp=1.0)
+2026-06-29 11:48:30,985 INFO    kyros.backtest | About to make ~11 LLM calls (est. ~$0.03).
+2026-06-29 11:51:58,590 INFO    kyros.backtest | ── Stage 2: backtest engine (LLM in loop) ──
+2026-06-29 11:52:31,940 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:52:48,314 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:52:55,711 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:53:03,968 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:53:11,944 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:53:22,868 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:53:30,614 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:53:37,020 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:54:18,693 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:54:24,850 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:54:31,068 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:54:39,037 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:54:45,937 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:54:52,506 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:55:02,822 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:55:09,898 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:55:15,928 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:55:21,891 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:55:30,186 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:55:38,054 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:55:45,729 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:55:52,642 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:56:22,515 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:56:29,948 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:56:36,741 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:56:43,896 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:56:51,546 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:56:59,801 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:57:07,601 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:57:14,785 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:57:23,975 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:57:31,350 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:57:39,437 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:57:46,050 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:57:54,600 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:58:03,316 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:58:10,797 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:58:15,862 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:58:31,700 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:58:39,069 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:58:47,975 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:58:54,656 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:59:00,524 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:59:06,621 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:59:11,778 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:59:18,248 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:59:25,787 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:59:32,486 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:59:38,947 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:59:46,201 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 11:59:53,342 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:00:00,627 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:00:07,434 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:00:13,720 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:00:19,691 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:00:26,931 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:01:09,334 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:01:15,092 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:01:21,697 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:01:29,576 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:01:36,953 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:01:43,121 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:01:50,908 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:01:57,019 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:02:03,168 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:02:12,031 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:02:18,383 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:02:25,633 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:02:33,202 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:02:42,009 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:02:48,153 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:02:54,238 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:02:59,398 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:03:08,841 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:03:20,266 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:03:28,892 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:03:36,442 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:03:44,726 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:03:51,418 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:03:58,275 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:04:05,460 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:04:13,097 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:04:30,460 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:04:39,621 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:04:47,765 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:04:56,248 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:05:04,299 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:05:11,149 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:05:28,849 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:05:36,175 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:05:43,199 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:05:50,641 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:06:15,799 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:06:24,159 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:06:32,279 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:06:38,354 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:06:49,193 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:06:58,278 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:07:04,895 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:07:16,069 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:07:24,744 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:07:32,188 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:07:40,068 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:07:49,193 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:07:56,789 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:08:04,181 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:08:11,392 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:08:19,219 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:08:24,845 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:08:32,842 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:08:49,511 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:08:56,281 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:09:04,890 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:09:14,286 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:09:22,376 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:09:29,202 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:13:27,074 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:13:32,034 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:13:39,315 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:13:44,863 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:13:50,391 DEBUG   asyncio | Using selector: KqueueSelector
