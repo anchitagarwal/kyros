@@ -1,0 +1,34 @@
+2026-06-28 21:56:21,015 INFO    kyros.backtest | Logging to /Users/anchit/src/kyros/workspace/logs/backtest_20260628_215621.log
+2026-06-28 21:56:21,015 INFO    kyros.backtest | Kyros Phase 3A backtest runner
+2026-06-28 21:56:21,015 INFO    kyros.backtest | repo root  : /Users/anchit/src/kyros
+2026-06-28 21:56:21,015 INFO    kyros.backtest | date range : 2026-06-01 → 2026-06-14 (inclusive)
+2026-06-28 21:56:21,015 INFO    kyros.backtest | data backend: csv
+2026-06-28 21:56:21,015 INFO    kyros.backtest | csv path   : workspace/data/nq_1min_data.csv
+2026-06-28 21:56:21,015 INFO    kyros.backtest | Loading NQ 1m data...
+2026-06-28 21:56:21,015 INFO    kyros.backtest | Data ready in 0.0s → workspace/data/NQ_1m_2026-06-01_2026-06-14_csv.parquet
+2026-06-28 21:56:21,706 WARNING py.warnings | /Users/anchit/src/kyros/scripts/run_backtest.py:347: UserWarning: ReplayCandleSource: 10 non-contiguous 1m gap(s) detected in 13800 bars. Higher-TF resampling will produce sparse bars across these gaps. First gap(s): 2026-06-01 16:59:00-04:00 → 2026-06-01 18:00:00-04:00 (0 days 01:01:00); 2026-06-02 16:59:00-04:00 → 2026-06-02 18:00:00-04:00 (0 days 01:01:00); 2026-06-03 16:59:00-04:00 → 2026-06-03 18:00:00-04:00 (0 days 01:01:00); ...
+  cal = run_calibration(ReplayCandleSource(str(data_path), validate_gaps=True), progress)
+
+2026-06-28 21:56:22,245 INFO    kyros.backtest | ── Stage 1: trigger calibration (no LLM) ──
+2026-06-28 22:10:29,202 INFO    kyros.backtest | Calibration finished in 847.0s → workspace/calibration_report.json
+2026-06-28 22:10:29,203 INFO    kyros.backtest |   period               : 2026-05-31 20:00:00-04:00 → 2026-06-14 19:58:00-04:00
+2026-06-28 22:10:29,203 INFO    kyros.backtest |   1m candles evaluated : 13,799
+2026-06-28 22:10:29,203 INFO    kyros.backtest |   trigger fires        : 29
+2026-06-28 22:10:29,203 INFO    kyros.backtest |   est. LLM cost        : ~$0.09
+2026-06-28 22:10:29,203 INFO    kyros.backtest |   gate blocks (first failing gate per candle):
+2026-06-28 22:10:29,203 INFO    kyros.backtest |     no_killzone          10,199  (73.9%)
+2026-06-28 22:10:29,203 INFO    kyros.backtest |     no_htf_bias             210  ( 1.5%)
+2026-06-28 22:10:29,203 INFO    kyros.backtest |     no_dol                    1  ( 0.0%)
+2026-06-28 22:10:29,203 INFO    kyros.backtest |     cooldown_active       3,360  (24.3%)
+2026-06-28 22:10:29,203 INFO    kyros.backtest |     no_soft_trigger           0  ( 0.0%)
+2026-06-28 22:10:29,203 INFO    kyros.backtest |   soft triggers fired:
+2026-06-28 22:10:29,203 INFO    kyros.backtest |     fvg                      29
+2026-06-28 22:10:29,203 INFO    kyros.backtest |     ifvg                      0
+2026-06-28 22:10:29,203 INFO    kyros.backtest |     sweep                     0
+2026-06-28 22:10:29,203 INFO    kyros.backtest |     displacement              0
+2026-06-28 22:10:29,203 INFO    kyros.backtest |   fires by killzone:
+2026-06-28 22:10:29,203 INFO    kyros.backtest |     london_kz                 9
+2026-06-28 22:10:29,203 INFO    kyros.backtest |     ny_am_kz                 10
+2026-06-28 22:10:29,203 INFO    kyros.backtest |     ny_pm_kz                 10
+2026-06-28 22:10:29,209 INFO    kyros.backtest | --calibrate-only set; stopping before any LLM calls.
+2026-06-28 22:10:29,209 INFO    kyros.backtest | Full run (est. ~$0.09): drop --calibrate-only (add --yes to skip the prompt).

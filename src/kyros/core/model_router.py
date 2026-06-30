@@ -275,7 +275,7 @@ class ModelRouter:
         messages: list[dict],
         tools: list[dict],
         tool_fn: Callable[[str, dict], str],
-        max_turns: int = 80,
+        max_turns: int = 120,
         name: str | None = None,
         trace_id: str | None = None,
     ) -> ModelResponse:

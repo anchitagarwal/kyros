@@ -29,10 +29,18 @@ import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from trading.reasoning_agent import ICT_SYSTEM_PROMPT
 
 __all__ = ["PerformanceReport"]
+
+# Project display timezone. Trace timestamps arrive tz-aware ET, but a trace
+# round-tripped through JSON without an offset would parse naive — interpret
+# naive datetimes as ET (consistent with snapshot._parse_dt / outcome._to_utc)
+# so they never collide with the always-aware UTC golden timestamps.
+_NY = ZoneInfo("America/New_York")
+_UTC = ZoneInfo("UTC")
 
 # Mandatory bias disclaimer (verbatim).
 _DISCLAIMER = (
@@ -55,10 +63,16 @@ _GOLDEN_WINDOW_MIN = 15
 
 
 def _parse_ts(ts: Any) -> datetime:
-    """Parse a timestamp (datetime or ISO-8601 str) to an aware datetime."""
-    if isinstance(ts, datetime):
-        return ts
-    return datetime.fromisoformat(str(ts))
+    """Parse a timestamp (datetime or ISO-8601 str) to an aware datetime.
+
+    A naive input (e.g. a trace timestamp serialized without a UTC offset) is
+    assumed to be ET, so subtracting it from an aware golden timestamp never
+    raises ``can't subtract offset-naive and offset-aware datetimes``.
+    """
+    dt = ts if isinstance(ts, datetime) else datetime.fromisoformat(str(ts))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_NY)
+    return dt
 
 
 def _system_prompt_hash() -> str:
@@ -128,6 +142,7 @@ class PerformanceReport:
                 "win_count": 0,
                 "loss_count": 0,
                 "expired_count": 0,
+                "cancelled_count": 0,
                 "no_fill_count": 0,
                 "win_rate": 0.0,
                 "loss_rate": 0.0,
@@ -145,6 +160,7 @@ class PerformanceReport:
         wins = [t for t in filled if self._result(t) == "win"]
         losses = [t for t in filled if self._result(t) == "loss"]
         expired = [t for t in filled if self._result(t) == "expired"]
+        cancelled = [t for t in actionable if self._result(t) == "cancelled"]
         no_fill = [t for t in actionable if self._result(t) == "no_fill"]
 
         winning_rs = [self._rr(t) for t in wins if self._rr(t) is not None]
@@ -167,6 +183,7 @@ class PerformanceReport:
             "win_count": len(wins),
             "loss_count": len(losses),
             "expired_count": len(expired),
+            "cancelled_count": len(cancelled),
             "no_fill_count": len(no_fill),
             "win_rate": (len(wins) / len(filled)) if filled else 0.0,
             "loss_rate": (len(losses) / len(filled)) if filled else 0.0,
@@ -232,11 +249,15 @@ class PerformanceReport:
     # ── golden match ────────────────────────────────────────────────────────
 
     def _golden_match_rate(self, traces: list[dict], golden_path) -> dict:
-        """Compute the golden-dataset match rate.
+        """Compute the golden-dataset match rate over the backtested window.
 
-        For each golden entry, check if any trace exists within ±15 min of
-        the community timestamp AND has the same direction. The golden file
-        is untrusted data — matched only, never executed as instructions.
+        For each golden entry WITHIN the backtested window, check if any trace
+        exists within ±15 min of the community timestamp AND has the same
+        direction. The denominator is scoped to the window because a golden
+        entry outside the trace time span (by more than the match window) can
+        never match — counting the whole multi-year golden file would make the
+        rate structurally near-zero and misleading. The golden file is
+        untrusted data — matched only, never executed as instructions.
         """
         golden_path = Path(golden_path)
         if not golden_path.exists():
@@ -252,14 +273,27 @@ class PerformanceReport:
 
         # Pre-parse trace timestamps + directions.
         trace_points = []
+        all_trace_ts = []
         for t in traces:
             ts_str = t.get("timestamp", "")
-            bias = t.get("alert", {}).get("bias", "")
-            if ts_str and bias in ("long", "short"):
-                try:
-                    trace_points.append((_parse_ts(ts_str), bias))
-                except (ValueError, TypeError):
-                    continue
+            if not ts_str:
+                continue
+            try:
+                ts = _parse_ts(ts_str)
+            except (ValueError, TypeError):
+                continue
+            all_trace_ts.append(ts)
+            if t.get("alert", {}).get("bias", "") in ("long", "short"):
+                trace_points.append((ts, t["alert"]["bias"]))
+
+        if not all_trace_ts:
+            return {"total": 0, "matched": 0, "rate": 0.0}
+
+        # Backtested window, padded by the match tolerance: golden entries
+        # outside it are unmatchable and excluded from the denominator.
+        pad = timedelta(minutes=_GOLDEN_WINDOW_MIN)
+        window_start = min(all_trace_ts) - pad
+        window_end = max(all_trace_ts) + pad
 
         matched = 0
         total = 0
@@ -268,7 +302,6 @@ class PerformanceReport:
             direction = entry.get("direction")
             if direction not in ("long", "short"):
                 continue
-            total += 1
             date = entry.get("date", "")
             time_et = entry.get("time_et", "")
             if not date or not time_et:
@@ -277,6 +310,11 @@ class PerformanceReport:
                 golden_ts = self._parse_golden_ts(date, time_et)
             except (ValueError, TypeError):
                 continue
+
+            # Scope to the backtested window.
+            if not (window_start <= golden_ts <= window_end):
+                continue
+            total += 1
 
             # Check if any trace is within ±15 min and same direction.
             for trace_ts, trace_bias in trace_points:
@@ -293,14 +331,15 @@ class PerformanceReport:
         """Parse a golden entry's (date, time_et) into an aware datetime.
 
         Golden entries use ET clock times. We parse as America/New_York and
-        convert to UTC for comparison with trace timestamps (which are UTC).
+        convert to UTC for comparison with trace timestamps. ``time_et`` may be
+        ``HH:MM`` or ``HH:MM:SS`` — seconds are only appended when absent, so an
+        entry that already carries seconds is not mangled into invalid ISO (which
+        would otherwise be silently dropped from the match numerator).
         """
-        from zoneinfo import ZoneInfo
-
-        ny = ZoneInfo("America/New_York")
-        dt_str = f"{date} {time_et}:00"
-        dt = datetime.fromisoformat(dt_str).replace(tzinfo=ny)
-        return dt.astimezone(ZoneInfo("UTC"))
+        # Append ":00" only when seconds are absent (two colons → has seconds).
+        secs = "" if time_et.count(":") >= 2 else ":00"
+        dt = datetime.fromisoformat(f"{date} {time_et}{secs}").replace(tzinfo=_NY)
+        return dt.astimezone(_UTC)
 
     # ── metric helpers ──────────────────────────────────────────────────────
 
@@ -388,6 +427,8 @@ class PerformanceReport:
                      f"({overall['loss_count']})")
         lines.append(f"- Expired rate (of filled): {overall['expired_rate']:.1%} "
                      f"({overall['expired_count']})")
+        lines.append(f"- Cancelled (target/stop hit before entry): "
+                     f"{overall['cancelled_count']}")
         lines.append(f"- Avg winning R: {overall['avg_winning_r']:.2f}")
         lines.append(f"- Avg losing R: {overall['avg_losing_r']:.2f}")
         pf = overall['profit_factor']
@@ -426,7 +467,8 @@ class PerformanceReport:
 
         # Golden match
         lines.append("## Golden Dataset Match\n")
-        lines.append(f"- Total directional golden entries: {golden['total']}")
+        lines.append(f"- Total directional golden entries (within backtest window): "
+                     f"{golden['total']}")
         lines.append(f"- Matched (within ±15 min, same direction): {golden['matched']}")
         lines.append(f"- Match rate: {golden['rate']:.1%}")
         lines.append("")

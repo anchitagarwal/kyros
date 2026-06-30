@@ -1,0 +1,49 @@
+2026-06-29 12:13:55,548 INFO    kyros.backtest | Logging to /Users/anchit/src/kyros/workspace/logs/backtest_20260629_121355.log
+2026-06-29 12:13:55,548 INFO    kyros.backtest | Kyros Phase 3A backtest runner
+2026-06-29 12:13:55,549 INFO    kyros.backtest | repo root  : /Users/anchit/src/kyros
+2026-06-29 12:13:55,549 INFO    kyros.backtest | date range : 2026-06-01 → 2026-06-04 (inclusive)
+2026-06-29 12:13:55,549 INFO    kyros.backtest | data backend: csv
+2026-06-29 12:13:55,549 INFO    kyros.backtest | csv path   : workspace/data/nq_1min_data.csv
+2026-06-29 12:13:55,549 INFO    kyros.backtest | Loading NQ 1m data...
+2026-06-29 12:13:55,549 INFO    kyros.backtest | Data ready in 0.0s → workspace/data/NQ_1m_2026-06-01_2026-06-04_csv.parquet
+2026-06-29 12:13:56,123 WARNING py.warnings | /Users/anchit/src/kyros/scripts/run_backtest.py:353: UserWarning: ReplayCandleSource: 4 non-contiguous 1m gap(s) detected in 5520 bars. Higher-TF resampling will produce sparse bars across these gaps. First gap(s): 2026-06-01 16:59:00-04:00 → 2026-06-01 18:00:00-04:00 (0 days 01:01:00); 2026-06-02 16:59:00-04:00 → 2026-06-02 18:00:00-04:00 (0 days 01:01:00); 2026-06-03 16:59:00-04:00 → 2026-06-03 18:00:00-04:00 (0 days 01:01:00); ...
+  cal = run_calibration(ReplayCandleSource(str(data_path), validate_gaps=True), progress)
+
+2026-06-29 12:13:56,330 INFO    kyros.backtest | ── Stage 1: trigger calibration (no LLM) ──
+2026-06-29 12:18:54,687 INFO    kyros.backtest | Calibration finished in 298.4s → workspace/calibration_report.json
+2026-06-29 12:18:54,687 INFO    kyros.backtest |   period               : 2026-05-31 20:00:00-04:00 → 2026-06-04 19:58:00-04:00
+2026-06-29 12:18:54,687 INFO    kyros.backtest |   1m candles evaluated : 5,519
+2026-06-29 12:18:54,687 INFO    kyros.backtest |   trigger fires        : 11
+2026-06-29 12:18:54,687 INFO    kyros.backtest |   est. LLM cost        : ~$0.03
+2026-06-29 12:18:54,687 INFO    kyros.backtest |   gate blocks (first failing gate per candle):
+2026-06-29 12:18:54,687 INFO    kyros.backtest |     no_killzone           4,079  (73.9%)
+2026-06-29 12:18:54,687 INFO    kyros.backtest |     no_htf_bias             210  ( 3.8%)
+2026-06-29 12:18:54,687 INFO    kyros.backtest |     no_dol                    1  ( 0.0%)
+2026-06-29 12:18:54,687 INFO    kyros.backtest |     cooldown_active       1,218  (22.1%)
+2026-06-29 12:18:54,688 INFO    kyros.backtest |     no_soft_trigger           0  ( 0.0%)
+2026-06-29 12:18:54,688 INFO    kyros.backtest |   soft triggers fired:
+2026-06-29 12:18:54,688 INFO    kyros.backtest |     fvg                      11
+2026-06-29 12:18:54,688 INFO    kyros.backtest |     ifvg                      0
+2026-06-29 12:18:54,688 INFO    kyros.backtest |     sweep                     0
+2026-06-29 12:18:54,688 INFO    kyros.backtest |     displacement              0
+2026-06-29 12:18:54,688 INFO    kyros.backtest |   fires by killzone:
+2026-06-29 12:18:54,688 INFO    kyros.backtest |     london_kz                 3
+2026-06-29 12:18:54,688 INFO    kyros.backtest |     ny_am_kz                  4
+2026-06-29 12:18:54,688 INFO    kyros.backtest |     ny_pm_kz                  4
+2026-06-29 12:18:54,689 INFO    kyros.backtest | reasoning model: anthropic/claude-opus-4-8 (temp=1.0)
+2026-06-29 12:18:54,689 INFO    kyros.backtest | About to make ~11 LLM calls (est. ~$0.03).
+2026-06-29 12:18:54,945 INFO    kyros.backtest | ── Stage 2: backtest engine (LLM in loop) ──
+2026-06-29 12:18:54,953 INFO    kyros.backtest | Found 120 existing alerts in trade_alerts.jsonl — those timestamps will be skipped (resume; no re-spend).
+2026-06-29 12:18:54,953 WARNING kyros.backtest | Existing alerts are INCLUDED in the report. To start clean, archive the ledger first (see --help).
+2026-06-29 12:22:15,041 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:22:24,847 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:22:30,580 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:22:38,782 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:22:45,506 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:22:53,211 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:23:01,504 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:23:10,906 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:23:57,531 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:24:05,401 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:24:11,649 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-29 12:24:16,186 DEBUG   asyncio | Using selector: KqueueSelector

@@ -145,8 +145,8 @@ def test_calibration_report_json_written(tmp_path, monkeypatch):
     data = json.loads(out_path.read_text())
     required = {
         "period", "total_1m_candles", "gate_blocks", "soft_triggers",
-        "fires_by_killzone", "fires_by_month", "total_fires",
-        "estimated_llm_cost_usd",
+        "structures_present", "sweeps_by_session", "fires_by_killzone",
+        "fires_by_month", "total_fires", "estimated_llm_cost_usd",
     }
     assert required.issubset(data.keys()), f"missing: {required - set(data.keys())}"
     assert data["total_fires"] == report.total_fires
@@ -169,6 +169,99 @@ def test_calibration_report_soft_trigger_keys(tmp_path, monkeypatch):
     report = cal.run(src)
     for key in ("fvg", "ifvg", "sweep", "displacement"):
         assert key in report.soft_triggers
+
+
+def test_structures_present_keys(tmp_path, monkeypatch):
+    """structures_present has the four soft-trigger keys."""
+    monkeypatch.chdir(tmp_path)
+    cal, src = _make_calibrator("sweep_and_fvg", n_bars=100)
+    report = cal.run(src)
+    for key in ("fvg", "ifvg", "sweep", "displacement"):
+        assert key in report.structures_present
+
+
+def test_sweeps_by_session_keys(tmp_path, monkeypatch):
+    """sweeps_by_session has all 15 session-level keys."""
+    monkeypatch.chdir(tmp_path)
+    cal, src = _make_calibrator("sweep_and_fvg", n_bars=100)
+    report = cal.run(src)
+    expected = {
+        "midnight_open", "true_day_open", "london_open", "open_830", "open_930",
+        "asia_high", "asia_low", "london_high", "london_low",
+        "nyam_high", "nyam_low", "nylunch_high", "nylunch_low", "nypm_high", "nypm_low",
+    }
+    assert expected == set(report.sweeps_by_session.keys())
+
+
+def test_soft_trigger_keys_cover_engine_triggers():
+    """The calibrator's _SOFT_KEYS must cover every TriggerEngine soft trigger.
+
+    Guards against drift: if a new soft trigger is added to
+    TriggerEngine.soft_triggers_present but not to _SOFT_KEYS, structures_present
+    would silently never count it. This test turns that into a loud failure.
+    """
+    from backtesting.calibrator import _SOFT_KEYS
+
+    class _Snap:
+        fvgs: dict = {}
+        ifvgs: dict = {}
+        recent_sweeps: dict = {}
+        displacements: dict = {}
+
+    engine_keys = set(TriggerEngine(CooldownState()).soft_triggers_present(_Snap()).keys())
+    assert engine_keys <= set(_SOFT_KEYS), (
+        f"TriggerEngine soft triggers {engine_keys - set(_SOFT_KEYS)} are not in "
+        f"calibrator _SOFT_KEYS — structures_present would silently miss them"
+    )
+
+
+def test_count_structures_is_independent_of_priority():
+    """_count_structures increments every present structure, not just the first.
+
+    Uses a real calibrator so the shared TriggerEngine.soft_triggers_present
+    drives the counts (no duplicated predicates).
+    """
+    from backtesting.calibrator import CalibrationReport
+
+    class _Snap:
+        fvgs = {"5m": [{"type": "fvg_bullish", "top": 100.0, "bottom": 99.0}]}
+        ifvgs: dict = {}
+        recent_sweeps = {"15m": [{"type": "sweep_ssl", "swept_level": 98.0}]}
+        displacements = {"5m": [{"type": "displacement_bullish", "strength": 2.0}]}
+        session_levels = {"asia_high": 100.0, "asia_low": 95.0, "midnight_open": None}
+
+    cal, _ = _make_calibrator("flat", n_bars=1)
+    report = CalibrationReport()
+    cal._count_structures(report, _Snap())
+
+    # fvg fires first in TriggerEngine, but every present structure is counted.
+    assert report.structures_present["fvg"] == 1
+    assert report.structures_present["sweep"] == 1
+    assert report.structures_present["displacement"] == 1
+    assert report.structures_present["ifvg"] == 0
+
+
+def test_sweeps_by_session_matches_swept_level():
+    """sweeps_by_session counts the session level the sweep actually ran, not
+    every level that merely exists on the snapshot."""
+    from backtesting.calibrator import CalibrationReport
+
+    class _Snap:
+        fvgs: dict = {}
+        ifvgs: dict = {}
+        # swept_level 100.0 matches asia_high exactly; nothing matches asia_low.
+        recent_sweeps = {"15m": [{"type": "sweep_bsl", "swept_level": 100.0}]}
+        displacements: dict = {}
+        # midnight_open is always defined but was NOT swept — must stay 0.
+        session_levels = {"asia_high": 100.0, "asia_low": 95.0, "midnight_open": 99.0}
+
+    cal, _ = _make_calibrator("flat", n_bars=1)
+    report = CalibrationReport()
+    cal._count_structures(report, _Snap())
+
+    assert report.sweeps_by_session["asia_high"] == 1
+    assert report.sweeps_by_session["asia_low"] == 0
+    assert report.sweeps_by_session["midnight_open"] == 0
 
 
 def test_calibration_report_period_populated(tmp_path, monkeypatch):

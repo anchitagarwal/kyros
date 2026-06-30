@@ -1,0 +1,8 @@
+2026-06-28 19:41:34,639 INFO    kyros.backtest | Logging to /Users/anchit/src/kyros/workspace/logs/backtest_20260628_194134.log
+2026-06-28 19:41:34,639 INFO    kyros.backtest | Kyros Phase 3A backtest runner
+2026-06-28 19:41:34,639 INFO    kyros.backtest | repo root  : /Users/anchit/src/kyros
+2026-06-28 19:41:34,639 INFO    kyros.backtest | date range : 2024-06-09 → 2026-06-26 (inclusive)
+2026-06-28 19:41:34,639 INFO    kyros.backtest | data backend: csv
+2026-06-28 19:41:34,639 INFO    kyros.backtest | csv path   : workspace/data/nq_1min_data.csv
+2026-06-28 19:41:34,639 INFO    kyros.backtest | Loading NQ 1m data...
+2026-06-28 19:41:34,639 INFO    kyros.backtest | Data ready in 0.0s → workspace/data/NQ_1m_2024-06-09_2026-06-26_csv.parquet

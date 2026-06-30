@@ -3,16 +3,36 @@
 The BacktestEngine replays a CandleSource through the production TradingLoop
 (with live LLM inference), captures each emitted alert with its metadata
 (trigger reason, raw LLM output, snapshot summary), and attaches an
-OutcomeSimulator result to produce a TradeTrace. Traces are appended
-idempotently to ``trade_traces.jsonl``.
+OutcomeSimulator result to produce a TradeTrace.
+
+Two-phase persistence
+---------------------
+The expensive, irrecoverable part of a run is the LLM call. Outcomes, by
+contrast, are a pure function of (alert, candles) and can always be recomputed
+offline. So the engine splits writing into two phases:
+
+  Phase A (online, crash-safe ledger): the moment the LLM returns an alert, the
+    engine appends it — with its raw LLM output and snapshot summary, but NO
+    outcome yet — to ``trade_alerts.jsonl`` and fsyncs. This append-only file is
+    the resume ledger; a crash mid-replay loses at most the single in-flight
+    call, never the whole run.
+
+  Phase B (offline): after the source is exhausted, the engine resolves an
+    outcome for every alert (resumed + new) from the replay buffer and writes
+    the full traces to ``trade_traces.jsonl`` (a derived file, rewritten
+    atomically each run). Because it is regenerable from the ledger + data, it
+    is safe to overwrite; the precious raw LLM outputs live only in the
+    append-only ledger.
 
 Resume logic
 ------------
-On restart, the engine reads existing ``trade_traces.jsonl`` and collects the
-processed alert timestamps. During replay, alerts whose timestamp is already
-in the file are skipped (no duplicate TradeTrace written). The cooldown state
-is rebuilt from the existing traces' alert biases so subsequent triggers fire
-identically to the first run — no LLM re-call is needed for resumed alerts.
+On restart, the engine reads the ``trade_alerts.jsonl`` ledger (falling back to
+a legacy ``trade_traces.jsonl`` if only that exists, so a half-migrated run does
+not re-spend) and collects the processed alert timestamps. During replay, alerts
+whose timestamp is already in the ledger are skipped — the stored alert is
+reconstructed to drive cooldown so subsequent triggers fire identically to the
+first run, and its outcome is recomputed in Phase B. No LLM re-call is made for
+a resumed alert.
 
 Replay buffer
 -------------
@@ -32,6 +52,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -108,13 +129,19 @@ class BacktestEngine:
         loop: a TradingLoop (the engine uses its window, builder, trigger,
             agent, and cooldown components).
         simulator: an OutcomeSimulator.
-        output_path: path to the trade_traces.jsonl file.
+        output_path: path to the trade_traces.jsonl file (the Phase B output).
+        alerts_path: path to the crash-safe Phase A ledger. Defaults to a
+            sibling ``trade_alerts.jsonl`` next to ``output_path``.
     """
 
-    def __init__(self, loop, simulator, output_path: Path = Path("workspace/trade_traces.jsonl")):
+    def __init__(self, loop, simulator,
+                 output_path: Path = Path("workspace/trade_traces.jsonl"),
+                 alerts_path: Path | None = None):
         self.loop = loop
         self.simulator = simulator
         self.output_path = Path(output_path)
+        self.alerts_path = (Path(alerts_path) if alerts_path is not None
+                            else self.output_path.with_name("trade_alerts.jsonl"))
 
     def run(self, source) -> list[TradeTrace]:
         """Drive ``source`` through the loop, attach outcomes, write traces.
@@ -122,8 +149,8 @@ class BacktestEngine:
         Returns a list of ALL TradeTrace objects (existing resumed ones +
         newly produced ones), ordered by timestamp.
         """
-        # ── Resume: read existing traces ────────────────────────────────────
-        existing_traces, processed_ts = self._load_existing()
+        # ── Resume: read the existing alert ledger ──────────────────────────
+        existing_alerts, processed_ts = self._load_existing()
 
         # Access the loop's components.
         window = self.loop.window
@@ -135,10 +162,12 @@ class BacktestEngine:
         # Replay buffer: all 1m candles processed (≥480 for meaningful runs).
         replay_buffer: list[dict] = []
 
-        # Deferred alerts: (alert, snapshot, trigger_reason, raw_llm_output).
-        deferred: list[tuple] = []
+        # Pending alerts awaiting Phase B outcome resolution. Each entry is
+        # (alert_record_dict, AlertPayload, alert_timestamp) and covers both
+        # resumed (from the ledger) and newly produced alerts.
+        pending: list[tuple] = []
 
-        # ── Drive the source candle by candle ───────────────────────────────
+        # ── Phase A: drive the source candle by candle ──────────────────────
         while not source.is_done():
             candles = source.next()
             if candles is None:
@@ -160,10 +189,12 @@ class BacktestEngine:
             alert_ts_str = str(alert_ts)
 
             if alert_ts_str in processed_ts:
-                # Resume: skip LLM call, use existing alert for cooldown.
-                existing_alert_dict = existing_traces[alert_ts_str].get("alert", {})
-                alert = AlertPayload(bias=existing_alert_dict.get("bias", "no_trade"))
+                # Resume: skip the LLM call. Reconstruct the stored alert to
+                # drive cooldown identically and to resolve its outcome below.
+                record = existing_alerts[alert_ts_str]
+                alert = self._alert_from_dict(record.get("alert", {}))
                 cooldown.update(alert, snapshot)
+                pending.append((record, alert, alert_ts))
                 continue
 
             # New alert: call the LLM and capture the raw output.
@@ -171,41 +202,44 @@ class BacktestEngine:
             alert = validate_rr(alert)
             cooldown.update(alert, snapshot)
 
-            # Defer for outcome resolution (after the source is exhausted).
-            deferred.append((alert, snapshot, result.reason, raw_llm_output))
+            # Persist immediately (crash-safe) BEFORE deferring outcome work.
+            record = self._build_alert_record(alert, snapshot, result.reason, raw_llm_output)
+            self._append_alert(record)
+            pending.append((record, alert, alert_ts))
 
-        # ── Resolve deferred alerts ─────────────────────────────────────────
+        # ── Phase B: resolve outcomes and write the derived trace file ──────
         # Parse candle timestamps once (chronological → sorted) so each alert
         # uses an O(log n) bisect instead of a full scan of the buffer.
         buffer_ts = [_parse_ts(c["timestamp"]) for c in replay_buffer]
 
-        new_traces: list[TradeTrace] = []
-        for alert, snapshot, trigger_reason, raw_llm_output in deferred:
-            subsequent = self._slice_subsequent(replay_buffer, buffer_ts, snapshot.timestamp)
+        traces: list[TradeTrace] = []
+        for record, alert, alert_ts in pending:
+            subsequent = self._slice_subsequent(replay_buffer, buffer_ts, alert_ts)
             outcome = self.simulator.simulate(alert, subsequent)
-            trace = self._build_trace(alert, snapshot, trigger_reason, raw_llm_output, outcome)
-            new_traces.append(trace)
-            self._append_trace(trace)
+            traces.append(self._trace_from_record(record, outcome))
 
-        # ── Return all traces (existing + new), ordered by timestamp ────────
-        all_traces = list(existing_traces.values())
-        # Convert existing trace dicts to TradeTrace objects.
-        all_trace_objs = [self._dict_to_trace(d) for d in all_traces] + new_traces
-        all_trace_objs.sort(key=lambda t: t.timestamp)
-        return all_trace_objs
+        traces.sort(key=lambda t: t.timestamp)
+        self._write_traces(traces)
+        return traces
 
     # ── resume helpers ──────────────────────────────────────────────────────
 
     def _load_existing(self) -> tuple[dict, set]:
-        """Read existing trade_traces.jsonl.
+        """Read the alert ledger (or legacy trace file) for resume.
 
-        Returns (traces_by_timestamp, set_of_processed_timestamps).
+        Reads ``trade_alerts.jsonl`` if present; otherwise falls back to a
+        legacy ``trade_traces.jsonl`` so a run written by the pre-split engine
+        still resumes without re-spending. Both formats carry ``timestamp`` and
+        ``alert``, which is all resume needs.
+
+        Returns (records_by_timestamp, set_of_processed_timestamps).
         """
-        traces: dict[str, dict] = {}
+        source_path = self.alerts_path if self.alerts_path.exists() else self.output_path
+        records: dict[str, dict] = {}
         processed: set[str] = set()
-        if not self.output_path.exists():
-            return traces, processed
-        for line in self.output_path.read_text().splitlines():
+        if not source_path.exists():
+            return records, processed
+        for line in source_path.read_text().splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -216,9 +250,34 @@ class BacktestEngine:
                 continue
             ts = rec.get("timestamp")
             if ts is not None:
-                traces[ts] = rec
+                records[ts] = rec
                 processed.add(ts)
-        return traces, processed
+        return records, processed
+
+    @staticmethod
+    def _alert_from_dict(d: dict) -> AlertPayload:
+        """Reconstruct an AlertPayload from a stored alert dict.
+
+        Used on resume to drive cooldown and recompute the outcome without
+        re-calling the LLM. ``entry_zone`` is normalized back to a 2-tuple.
+        """
+        ez = d.get("entry_zone", [0.0, 0.0])
+        entry_zone = ((float(ez[0]), float(ez[1]))
+                      if isinstance(ez, (list, tuple)) and len(ez) >= 2 else (0.0, 0.0))
+        return AlertPayload(
+            bias=d.get("bias", "no_trade"),
+            model=d.get("model", "none"),
+            conviction=int(d.get("conviction", 0)),
+            entry_zone=entry_zone,
+            stop=float(d.get("stop", 0.0)),
+            target=float(d.get("target", 0.0)),
+            dol=d.get("dol", {}),
+            risk_reward=float(d.get("risk_reward", 0.0)),
+            rationale=d.get("rationale", ""),
+            killzone=d.get("killzone", ""),
+            valid_until=d.get("valid_until", ""),
+            no_trade_reason=d.get("no_trade_reason"),
+        )
 
     # ── LLM capture ─────────────────────────────────────────────────────────
 
@@ -273,21 +332,39 @@ class BacktestEngine:
 
     # ── trace building ──────────────────────────────────────────────────────
 
-    def _build_trace(self, alert, snapshot, trigger_reason, raw_llm_output, outcome) -> TradeTrace:
-        """Build a TradeTrace from the alert, snapshot, and outcome."""
+    def _build_alert_record(self, alert, snapshot, trigger_reason, raw_llm_output) -> dict:
+        """Build the Phase A ledger record: everything but the outcome.
+
+        The record is the TradeTrace shape minus ``outcome`` — its ``trace_id``
+        is generated once here and reused when Phase B attaches the outcome, so
+        a resumed alert keeps a stable id across runs.
+        """
         ts_str = str(snapshot.timestamp)
-        trace_id = self._make_trace_id(ts_str, alert)
-        rr_validated = alert.risk_reward >= 1.0
+        return {
+            "trace_id": self._make_trace_id(ts_str, alert),
+            "timestamp": ts_str,
+            "instrument": snapshot.instrument,
+            "killzone": alert.killzone or snapshot.current_killzone or "",
+            "trigger_reason": trigger_reason,
+            "snapshot_summary": snapshot.to_compact_dict(),
+            "raw_llm_output": raw_llm_output,
+            "alert": alert.to_dict(),
+            "rr_validated": alert.risk_reward >= 1.0,
+        }
+
+    @staticmethod
+    def _trace_from_record(record: dict, outcome) -> TradeTrace:
+        """Combine a Phase A ledger record with a resolved outcome."""
         return TradeTrace(
-            trace_id=trace_id,
-            timestamp=ts_str,
-            instrument=snapshot.instrument,
-            killzone=alert.killzone or snapshot.current_killzone or "",
-            trigger_reason=trigger_reason,
-            snapshot_summary=snapshot.to_compact_dict(),
-            raw_llm_output=raw_llm_output,
-            alert=alert.to_dict(),
-            rr_validated=rr_validated,
+            trace_id=record.get("trace_id", ""),
+            timestamp=record.get("timestamp", ""),
+            instrument=record.get("instrument", ""),
+            killzone=record.get("killzone", ""),
+            trigger_reason=record.get("trigger_reason", ""),
+            snapshot_summary=record.get("snapshot_summary", {}),
+            raw_llm_output=record.get("raw_llm_output", ""),
+            alert=record.get("alert", {}),
+            rr_validated=record.get("rr_validated", False),
             outcome=outcome.to_dict(),
         )
 
@@ -296,26 +373,31 @@ class BacktestEngine:
         """Build a deterministic trace ID from timestamp + bias."""
         return f"{ts_str}_{alert.bias}_{uuid.uuid4().hex[:8]}"
 
-    @staticmethod
-    def _dict_to_trace(d: dict) -> TradeTrace:
-        """Convert a trace dict (from JSONL) to a TradeTrace object."""
-        return TradeTrace(
-            trace_id=d.get("trace_id", ""),
-            timestamp=d.get("timestamp", ""),
-            instrument=d.get("instrument", ""),
-            killzone=d.get("killzone", ""),
-            trigger_reason=d.get("trigger_reason", ""),
-            snapshot_summary=d.get("snapshot_summary", {}),
-            raw_llm_output=d.get("raw_llm_output", ""),
-            alert=d.get("alert", {}),
-            rr_validated=d.get("rr_validated", False),
-            outcome=d.get("outcome", {}),
-        )
+    # ── file IO ─────────────────────────────────────────────────────────────
 
-    # ── file append ─────────────────────────────────────────────────────────
+    def _append_alert(self, record: dict) -> None:
+        """Append one Phase A ledger record, fsynced for crash safety.
 
-    def _append_trace(self, trace: TradeTrace) -> None:
-        """Append one TradeTrace as a JSON line to output_path."""
+        The fsync is what makes resume reliable: an interrupted run loses at
+        most the single in-flight LLM call, never the whole replay. The cost is
+        trivial next to LLM call latency.
+        """
+        self.alerts_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.alerts_path, "a") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    def _write_traces(self, traces: list[TradeTrace]) -> None:
+        """Atomically (re)write the derived trace file in one pass.
+
+        Safe to overwrite: every trace is regenerable from the append-only
+        ledger plus the data. Writing to a temp file and ``os.replace``-ing it
+        means a crash mid-write never leaves a half-written trace file.
+        """
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.output_path, "a") as f:
-            f.write(json.dumps(trace.to_dict(), default=str) + "\n")
+        tmp = self.output_path.with_name(self.output_path.name + ".tmp")
+        with open(tmp, "w") as f:
+            for trace in traces:
+                f.write(json.dumps(trace.to_dict(), default=str) + "\n")
+        os.replace(tmp, self.output_path)

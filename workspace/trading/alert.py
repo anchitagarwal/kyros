@@ -6,12 +6,21 @@ loop emits it. Python recomputes the risk-reward from the geometry
 degenerate setups are downgraded to ``no_trade``.
 
 The LLM's arithmetic is NEVER trusted — Python owns the truth.
+
+Config threading (Phase 3B): ``validate_rr`` accepts an optional
+``config: TradingConfig = TradingConfig()``. The ``rr_min`` threshold (today's
+hardcoded ``1.0``) and a new ``conviction_min`` gate (today enforced only in
+the LLM prompt at 40; now also enforceable in Python — default 40 is
+byte-preserving per O0, see config.py) are read from config. With the default
+config, behavior is byte-identical to pre-change code.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from typing import Any
+
+from .config import TradingConfig
 
 __all__ = ["AlertPayload", "validate_rr"]
 
@@ -54,16 +63,34 @@ class AlertPayload:
         }
 
 
-def validate_rr(alert: AlertPayload) -> AlertPayload:
+def validate_rr(alert: AlertPayload, config: TradingConfig = TradingConfig()) -> AlertPayload:
     """Recompute R:R from geometry; downgrade sub-1:1 / degenerate to no_trade.
 
+    - already no_trade → returned unchanged (preserve the LLM's own
+      no_trade_reason; a no_trade alert carries placeholder 0/0 geometry that
+      would otherwise be misreported as "degenerate_stop").
     - entry_mid = (entry_zone[0] + entry_zone[1]) / 2
     - risk = abs(entry_mid - stop)
     - risk == 0 → no_trade, reason "degenerate_stop" (no division)
     - rr = abs(target - entry_mid) / risk
     - risk_reward is ALWAYS overwritten with round(rr, 2)
-    - rr < 1.0 → no_trade, reason "rr_below_1"
+    - rr < config.rr_min → no_trade, reason "rr_below_1"
+    - conviction < config.conviction_min → no_trade, reason "conviction_below_min"
+      (today enforced only in the LLM prompt at 40; default 40 is byte-preserving
+      per O0 — see config.py. The conviction gate runs AFTER the R:R recompute so
+      risk_reward is always the true geometry value, and only on directional
+      alerts, so a no_trade's placeholder geometry is never re-examined.)
+
+    Args:
+        alert: the AlertPayload to validate.
+        config: trading config (defaults reproduce today's behavior exactly).
     """
+    # Nothing to validate on a no_trade alert, and its geometry is placeholder
+    # (entry/stop/target all 0). Validating would clobber the LLM's real
+    # no_trade_reason with "degenerate_stop" — destroying the diagnostic.
+    if alert.bias == "no_trade":
+        return alert
+
     entry_mid = (alert.entry_zone[0] + alert.entry_zone[1]) / 2.0
     risk = abs(entry_mid - alert.stop)
 
@@ -78,11 +105,21 @@ def validate_rr(alert: AlertPayload) -> AlertPayload:
     rr = abs(alert.target - entry_mid) / risk
     updated = replace(alert, risk_reward=round(rr, 2))
 
-    if rr < 1.0:
+    if rr < config.rr_min:
         return replace(
             updated,
             bias="no_trade",
             no_trade_reason="rr_below_1",
+        )
+
+    # Conviction gate (Phase 3B). Today enforced only in the LLM prompt at 40;
+    # default 40 is byte-preserving per O0. Runs only on directional alerts
+    # that already passed the R:R gate, so risk_reward is the true value.
+    if alert.conviction < config.conviction_min:
+        return replace(
+            updated,
+            bias="no_trade",
+            no_trade_reason="conviction_below_min",
         )
     return updated
 

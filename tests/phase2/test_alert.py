@@ -55,6 +55,23 @@ def test_degenerate_stop_zero_risk():
     assert out.risk_reward == 0.0
 
 
+def test_no_trade_reason_preserved_through_validation():
+    """An LLM no_trade alert keeps its own reason — not clobbered to degenerate_stop.
+
+    no_trade alerts carry placeholder 0/0 geometry (risk == 0), which would
+    otherwise trip the degenerate_stop branch and destroy the LLM's real
+    rationale code. validate_rr must short-circuit on no_trade.
+    """
+    alert = AlertPayload(
+        bias="no_trade", model="none", conviction=0,
+        entry_zone=(0.0, 0.0), stop=0.0, target=0.0,
+        no_trade_reason="intermediate liquidity in path",
+    )
+    out = validate_rr(alert)
+    assert out.bias == "no_trade"
+    assert out.no_trade_reason == "intermediate liquidity in path"
+
+
 def test_llm_risk_reward_overridden_by_python():
     """LLM says rr=5.0 but geometry implies 1.5 → output 1.5."""
     alert = AlertPayload(

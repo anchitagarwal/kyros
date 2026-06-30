@@ -1,174 +1,138 @@
 ## Problem Statement
 
 
-Build the Phase 3A Evaluation Harness for Project Kyros: a backtesting engine
-that runs the Phase 2 TradingLoop over historical NQ replay data, calls the LLM
-to produce real AlertPayloads, simulates trade outcomes deterministically against
-subsequent candles, and generates a structured performance report.
+Build the Phase 3B Offline Tuning & Walk-Forward Harness for Project Kyros: an
+offline parameter optimizer that learns better trading parameters from realized
+outcomes and validates them honestly with walk-forward analysis. The LLM weights
+are never touched. Online/live adaptation is OUT OF SCOPE for this phase.
 
-Phase 2 is complete and validated (101 tests, APPROVE). workspace/trading/ is
-READ-ONLY — the evaluation harness calls it as a library. The backtest answers
-one question before live deployment: does this system generate tradeable ICT
-setups with positive expectancy?
+Phases 1, 2 and 3A are complete and validated. Phase 3A already produces
+workspace/trade_traces.jsonl — one line per LLM-triggered alert with a
+deterministically simulated outcome (win/loss/expired/no_fill + actual_rr). That
+file is the ground-truth reward signal this phase tunes against.
 
-The harness has four components:
+THE CORE INSIGHT that makes this cheap:
+Post-LLM gates (conviction floor, R:R floor, allowed model types, allowed
+killzones) decide only WHETHER TO TAKE an already-recorded trade. They never
+change entry_zone/stop/target, so they do not change a taken trade's outcome.
+Re-scoring them is therefore pure arithmetic over the existing trade_traces.jsonl:
+filter → reuse the recorded outcome → recompute metrics. Zero LLM calls, zero
+re-simulation (Tier 1). Pre-LLM params (killzone windows, confluence %, recency
+caps, HTF timeframe order) change WHAT fires and WHAT the LLM sees, so they need a
+fresh LLM backtest per config — Tier 2, an outer loop, explicitly cost-gated.
 
-1. TriggerCalibrator (no LLM) — diagnostic that maps TriggerEngine gate
-   distribution and firing rate over the full historical period without spending
-   API budget. Run this before BacktestEngine to catch miscalibration early.
+The harness has two tiers plus a config-injection prerequisite:
 
-2. BacktestEngine (LLM in the loop) — drives ReplayCandleSource through
-   historical data, runs the complete TradingLoop including LLM inference,
-   collects AlertPayload per trigger, passes to OutcomeSimulator.
+0. TradingConfig (prerequisite) — a dataclass holding every currently-hardcoded
+   knob, threaded through SnapshotBuilder/TriggerEngine/CooldownState/validate_rr
+   with defaults equal to today's literals. This is the ONLY permitted change to
+   the otherwise-frozen workspace/trading/ layer, and it must be behavior-preserving.
 
-3. OutcomeSimulator (no LLM, deterministic) — given an AlertPayload and
-   subsequent candles, determines win/loss/expired by walking candles forward
-   from alert timestamp. Uses the LLM's entry_zone/stop/target directly — no
-   rules about what these should be. The LLM already decided; the simulator
-   checks whether the market obliged.
+1. Tier 1 — post-LLM re-scoring (free): re-score recorded traces under candidate
+   PostLLMParams and recompute metrics by reusing PerformanceReport.
 
-4. PerformanceReport — aggregates outcomes into human-readable metrics and
-   writes backtest_report.md. Also produces calibration_report.json from
-   TriggerCalibrator output.
+2. Tier 2 — pre-LLM config sweep (cost-gated): for a small grid of TradingConfig
+   variants, run one full-span backtest each (reusing BacktestEngine), gated by a
+   TriggerCalibrator cost estimate before any spend.
+
+3. Walk-forward — rolling train/test split by timestamp: pick the best params on
+   each training slice, evaluate out-of-sample on the next unseen slice, and
+   compare against the baseline (default params) on the same windows.
 
 
 ## End Goal
 
 
-A tested, runnable evaluation harness that:
+A tested, runnable offline tuning harness that:
 
-1. TriggerCalibrator.run(source) → CalibrationReport:
-   - Processes full replay period without any LLM calls
-   - Reports fires per killzone, gate block distribution, soft trigger breakdown
-   - Writes workspace/calibration_report.json
+1. workspace/trading/config.py — TradingConfig dataclass + config_hash(), threaded
+   through the trading layer with defaults that reproduce current behavior exactly
+   (the full pre-existing Phase 1/2/3A test suite stays green with no behavioral edits).
 
-2. BacktestEngine.run(source) → list[TradeTrace]:
-   - Drives ReplayCandleSource end-to-end through historical data
-   - Calls TradingLoop (including live LLM inference) per candle
-   - Attaches OutcomeSimulator result to each AlertPayload
-   - Writes each trace as a JSON line to workspace/trade_traces.jsonl
-   - Resumes from last written trace on restart (idempotent)
+2. workspace/tuning/rescore.py — rescore_trace/rescore_traces: convert filtered
+   trades to no_trade (R=0), REUSE the recorded outcome for taken trades (never
+   re-simulate). Documented limitation: ignores cooldown re-interaction.
 
-3. OutcomeSimulator.simulate(alert, subsequent_candles) → TradeOutcome:
-   - Lookahead-safe: uses ONLY candles with timestamp > alert.timestamp
-   - Fill logic: first candle where price enters entry_zone → filled at entry_mid
-   - Win: subsequent candle high >= target (long) or low <= target (short)
-   - Loss: subsequent candle low <= stop (long) or high >= stop (short)
-   - Ambiguous (both in same candle): conservative → loss
-   - Expired: killzone ends with neither hit → no_fill
+3. workspace/tuning/objective.py — evaluate(traces, params) → (expectancy, metrics),
+   reusing PerformanceReport's metric computation; returns -inf below MIN_TRADES.
 
-4. PerformanceReport.generate(traces) → str:
-   - Writes workspace/backtest_report.md
-   - Metrics: total alerts, no_trade rate, win rate, avg R won, avg R lost,
-     profit factor, max drawdown (in R), by model type, by killzone,
-     by timeframe of primary FVG/OB, golden dataset hit rate
+4. workspace/tuning/search.py — best_params(train_traces, grid, min_trades).
 
-Full test suite runnable offline — BacktestEngine tests mock the LLM and
-OutcomeSimulator, TriggerCalibrator tests use MockCandleSource, all Phase 2
-modules are imported from workspace/trading/ as-is (READ-ONLY).
+5. workspace/tuning/walkforward.py — make_folds (rolling, by timestamp, no
+   train/test leakage) and run_walkforward producing per-fold IS and OOS results
+   plus a baseline comparison.
+
+6. workspace/tuning/report.py — WalkForwardReport.generate → workspace/walkforward_report.md
+   with per-fold IS vs OOS, aggregate OOS vs baseline, parameter-stability, an
+   overfitting warning, the Phase 3A optimism disclaimer, and an LLM-leakage note.
+
+7. scripts/run_tuning.py — CLI. Default (post-LLM only, default config) makes ZERO
+   LLM calls over an existing trade_traces.jsonl. --record drives the cost-gated
+   Tier-2 sweep first.
+
+Full test suite (tests/phase3b/) runs offline — no API key, Tier-1 path makes no
+LLM calls. All Phase 3A components (PerformanceReport, OutcomeSimulator,
+TriggerCalibrator, BacktestEngine) are imported and REUSED, not reimplemented.
 
 
 ## Constraints
 
 
 HARD CONSTRAINTS:
-- workspace/trading/ is READ-ONLY — import as a library, never modify
-- workspace/detectors/ is READ-ONLY — same rule as Phase 2
-- No broker, no IBKR, no live market data, no order placement
-- All tests must run offline — LLM calls mocked in tests, no API key required
-- OutcomeSimulator MUST NOT use the alert candle itself for outcome resolution
-  (only candles strictly after alert.timestamp); this is a CRITICAL correctness
-  invariant — lookahead here invalidates the entire backtest
+- workspace/detectors/ is READ-ONLY — never modify.
+- workspace/trading/ is SEMI-FROZEN — the ONLY permitted change is threading an
+  optional `config: TradingConfig = TradingConfig()` through SnapshotBuilder,
+  TriggerEngine, CooldownState, and validate_rr, replacing hardcoded literals with
+  config reads. Defaults MUST be byte-identical to today's behavior; the existing
+  test suite must stay green with no behavioral test edits. Any other change to
+  workspace/trading/ is a critical scope violation.
+- No broker, no IBKR, no live market data, no order placement.
+- All tuning tests run OFFLINE — no API key. The Tier-1 (post-LLM) path makes ZERO
+  LLM calls.
+- Re-scoring REUSES each recorded trade's outcome and MUST NOT re-simulate a
+  filtered post-LLM trade. Filtered trades become no_trade (R=0).
+- Walk-forward is ROLLING and splits strictly by timestamp; a trace may appear in a
+  fold's test OR its train, never both (no leakage). This invariant is critical —
+  leakage silently inflates out-of-sample results.
+
+REUSE (do not reimplement):
+- PerformanceReport (workspace/backtesting/report.py) — objective + report metrics.
+- OutcomeSimulator (workspace/backtesting/outcome.py) — only when entry/stop/target
+  change (never in Tier 1).
+- TriggerCalibrator (workspace/backtesting/calibrator.py) — Tier-2 cost gate.
+- BacktestEngine (workspace/backtesting/engine.py) — Tier-2 per-config recording,
+  idempotent resume.
+- KyrosAgentLoader.get_model_engine("trading", fallback_role="executor") — model
+  selection.
 
 MODULE LAYOUT:
-  workspace/backtesting/
+  workspace/trading/config.py        — TradingConfig dataclass + config_hash()
+  workspace/tuning/
     __init__.py
-    data_loader.py     — load + cache NQ historical data; backends:
-                         yfinance/alpaca (download), csv (local file)
-    calibrator.py      — TriggerCalibrator, CalibrationReport
-    engine.py          — BacktestEngine
-    outcome.py         — OutcomeSimulator, TradeOutcome
-    report.py          — PerformanceReport
+    params.py        — PostLLMParams, PreLLMGrid, param_grid()
+    rescore.py       — rescore_trace(), rescore_traces()
+    objective.py     — evaluate()
+    search.py        — best_params()
+    walkforward.py   — make_folds(), run_walkforward()
+    report.py        — WalkForwardReport
+  scripts/run_tuning.py              — CLI; --record drives cost-gated Tier-2
+  workspace/tuning/runs/{config_hash}/trade_{alerts,traces}.jsonl  — per-config
+  workspace/walkforward_report.md    — human-readable walk-forward output
 
-  workspace/
-    trade_traces.jsonl      — one JSON line per LLM-triggered alert + outcome
-    calibration_report.json — TriggerCalibrator output
-    backtest_report.md      — human-readable PerformanceReport output
+OBJECTIVE & WALK-FORWARD:
+- Objective: expectancy_per_trade (mean actual_rr, no_trade=0), subject to a
+  MIN_TRADES guard that rejects param sets with too few taken trades.
+- Rolling window with configurable --train-days/--test-days/--step-days.
+- Tier-2 LLM cost = n_pre_llm_configs × one full-span backtest (folds do NOT
+  multiply cost — record each config once over the whole span, slice by timestamp).
 
-TRADE TRACE SCHEMA (one JSON line per trace in trade_traces.jsonl):
-{
-  "trace_id":         str,          // uuid4
-  "timestamp":        str,          // ISO — when alert fired
-  "instrument":       "NQ",
-  "killzone":         str,
-  "trigger_reason":   str,          // which soft trigger fired
-  "snapshot_summary": dict,         // compact snapshot — no raw candles
-  "raw_llm_output":   str,          // raw string returned by model_router.call()
-  "alert":            dict,         // AlertPayload as dict
-  "rr_validated":     bool,         // did Python R:R validator run?
-  "outcome": {
-    "result":                "win" | "loss" | "expired" | "no_fill" | "no_trade",
-    "candles_to_fill":       int | null,
-    "candles_to_resolution": int | null,
-    "fill_price":            float | null,
-    "exit_price":            float | null,
-    "actual_rr":             float | null   // realized R, negative for loss
-  }
-}
+HONESTY DIAGNOSTICS (mandatory in the report):
+- Only walk-forward OOS numbers are trustworthy; report IS vs OOS AND tuned vs
+  baseline OOS. If tuned OOS <= baseline OOS, tuning added nothing — state it plainly.
+- Parameter-stability across folds: wildly different per-fold winners = noise.
+- Carry forward the Phase 3A optimism disclaimer and add a leakage note (the LLM's
+  training data overlaps the backtest period).
 
-CALIBRATION REPORT SCHEMA (workspace/calibration_report.json):
-{
-  "period":           {"start": str, "end": str},
-  "total_1m_candles": int,
-  "gate_blocks": {
-    "no_killzone":    int,
-    "no_htf_bias":    int,
-    "no_dol":         int,
-    "cooldown_active": int
-  },
-  "soft_triggers": {
-    "active_fvg":     int,
-    "ifvg":           int,
-    "sweep":          int,
-    "displacement":   int
-  },
-  "fires_by_killzone": {"london_kz": int, "ny_am_kz": int, "ny_pm_kz": int},
-  "fires_by_month":    {"2024-01": int, ...},
-  "total_fires":       int,
-  "estimated_llm_cost_usd": float
-}
-
-DATA LOADER:
-  DataLoader supports three backends (configured via env var KYROS_DATA_BACKEND):
-    "yfinance"  — downloads /NQ=F in 7-day 1m chunks, stitches, caches to parquet
-                  Use for dev/recent data testing only
-    "alpaca"    — uses Alpaca Markets API (ALPACA_API_KEY, ALPACA_SECRET_KEY env vars)
-                  for 1m NQ futures data up to 5 years back
-                  Use for full historical backtest
-    "csv"       — local 1m CSV exported offline by an external tool (path via
-                  KYROS_CSV_PATH, default workspace/data/nq_1min_data.csv).
-                  Columns: date (UTC), open, high, low, close, volume; extra columns
-                  (e.g. contract) are ignored. Normalizes date→timestamp (UTC),
-                  filters to [start, end], caches to the same parquet format.
-                  No network access — never imports a broker/IBKR client.
-  BacktestEngine and TriggerCalibrator consume cached parquet — never re-download
-
-  Active for this phase: KYROS_DATA_BACKEND=csv → workspace/data/nq_1min_data.csv
-  (1m bars, 2024-06-09 → present, exported offline from TWS). Base timeframe stays
-  1m — ReplayCandleSource in workspace/trading/ is used as-is (READ-ONLY, no edits).
-
-PERFORMANCE REPORT must include:
-  - LLM contamination disclaimer: "Backtest results may be optimistically biased.
-    The LLM's training data includes market commentary from the backtest period.
-    Treat metrics as directional signal for comparing system versions, not as
-    prediction of live performance."
-  - System prompt hash (first 8 chars of sha256 of ICT_SYSTEM_PROMPT) for
-    version tracking — allows comparison across prompt iterations
-
-BACKTESTING VALIDITY:
-  - BacktestEngine must pass the same cooldown logic as production TradingLoop
-    (tiered CooldownState from workspace/trading/cooldown.py)
-  - No look-ahead: ReplayCandleSource in workspace/trading/candle_source.py
-    already enforces this — BacktestEngine must not bypass it
-  - resume_from argument: BacktestEngine reads existing trade_traces.jsonl
-    and skips already-processed timestamps on restart
+PERFORMANCE / VALIDITY:
+- Tier 1 must run in milliseconds over an existing trade_traces.jsonl.
+- Determinism: same traces + same params → same metrics and same fold splits.
