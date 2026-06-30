@@ -153,6 +153,29 @@ def test_recent_sweeps_capped_at_10():
         assert len(snap.recent_sweeps[tf]) <= 10
 
 
+def test_market_structure_keys_all_timeframes():
+    snap = _build_snapshot("sweep_and_fvg")
+    assert set(snap.market_structure.keys()) == set(TIMEFRAMES)
+
+
+def test_market_structure_capped_at_10_and_well_formed():
+    snap = _build_snapshot("sweep_and_fvg", n=100)
+    valid = {"bos_bullish", "bos_bearish", "choch_bullish", "choch_bearish"}
+    for tf in TIMEFRAMES:
+        events = snap.market_structure[tf]
+        assert len(events) <= 10
+        for e in events:
+            assert e["type"] in valid
+            assert "break_price" in e and "timestamp" in e
+
+
+def test_market_structure_in_compact_dict():
+    snap = _build_snapshot("sweep_and_fvg")
+    cd = snap.to_compact_dict()
+    assert "market_structure" in cd
+    assert set(cd["market_structure"].keys()) == set(TIMEFRAMES)
+
+
 def test_determinism_same_window_same_snapshot():
     w = _build_window("sweep_and_fvg", n=60)
     b = SnapshotBuilder()

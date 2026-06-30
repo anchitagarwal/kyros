@@ -282,6 +282,92 @@ def test_engine_captures_raw_llm_output(tmp_path):
         assert t.raw_llm_output == _RAW_LLM
 
 
+# ── Two-phase persistence / crash safety ──────────────────────────────────────
+
+
+def test_engine_writes_alert_ledger(tmp_path):
+    """Phase A writes a trade_alerts.jsonl ledger alongside the trace file.
+
+    Every ledger line carries the alert + raw LLM output but NO outcome — the
+    outcome lives only in the derived trade_traces.jsonl.
+    """
+    engine, src = _make_engine(tmp_path, scenario="sweep_and_fvg", n=100)
+    traces = engine.run(src)
+    assert len(traces) >= 1
+
+    assert engine.alerts_path.name == "trade_alerts.jsonl"
+    ledger_lines = [l for l in engine.alerts_path.read_text().splitlines() if l.strip()]
+    assert len(ledger_lines) == len(traces)
+    for line in ledger_lines:
+        rec = json.loads(line)
+        assert "raw_llm_output" in rec
+        assert "alert" in rec
+        assert "outcome" not in rec, "ledger must not carry outcomes (Phase A)"
+
+
+def test_engine_resumes_from_ledger_without_trace_file(tmp_path):
+    """A crash before Phase B leaves only the ledger; resume must not re-spend.
+
+    Simulate the exact failure that motivated this design: the ledger exists
+    (alerts were fsynced during replay) but trade_traces.jsonl was never
+    written. The resumed run must skip every ledgered timestamp (no LLM call)
+    and still produce the full trace file.
+    """
+    engine1, src1 = _make_engine(tmp_path, scenario="sweep_and_fvg", n=100)
+    engine1.run(src1)
+    n1 = sum(1 for l in engine1.alerts_path.read_text().splitlines() if l.strip())
+    assert n1 >= 1
+
+    # Simulate the crash: delete the derived trace file, keep the ledger.
+    engine1.output_path.unlink()
+
+    engine2, src2 = _make_engine(
+        tmp_path, scenario="sweep_and_fvg", n=100,
+        output_path=engine1.output_path,
+    )
+    traces2 = engine2.run(src2)
+
+    # No LLM calls on resume — every alert came from the ledger.
+    engine2.loop.agent.reason.assert_not_called()
+    # Ledger unchanged (no duplicate appends) and trace file regenerated.
+    n2 = sum(1 for l in engine2.alerts_path.read_text().splitlines() if l.strip())
+    assert n2 == n1
+    assert len(traces2) == n1
+    assert engine2.output_path.exists()
+
+
+def test_engine_resumes_from_legacy_trace_file(tmp_path):
+    """If only a legacy trade_traces.jsonl exists (no ledger), still resume.
+
+    Back-compat: a run from the pre-split engine left full traces but no
+    ledger. The resumed run must read those timestamps and skip the LLM.
+    """
+    # Hand-write a legacy trace file with one resolved trace, then point a
+    # fresh engine at it with no ledger present.
+    engine0, src0 = _make_engine(tmp_path, scenario="sweep_and_fvg", n=100)
+    engine0.run(src0)
+    legacy = engine0.output_path.read_text()
+    first_ts = json.loads(next(l for l in legacy.splitlines() if l.strip()))["timestamp"]
+
+    # Reset: keep only the legacy trace file, remove the ledger.
+    engine0.alerts_path.unlink()
+
+    engine1, src1 = _make_engine(
+        tmp_path, scenario="sweep_and_fvg", n=100,
+        output_path=engine0.output_path,
+    )
+    _, processed = engine1._load_existing()
+    assert first_ts in processed, "legacy trace timestamps must seed resume"
+
+
+def test_engine_trace_file_written_atomically_no_tmp_left(tmp_path):
+    """Phase B leaves no .tmp file behind after a successful write."""
+    engine, src = _make_engine(tmp_path, scenario="sweep_and_fvg", n=100)
+    engine.run(src)
+    leftovers = list(tmp_path.glob("*.tmp"))
+    assert leftovers == [], f"temp files left behind: {leftovers}"
+
+
 # ── TradeTrace.to_dict ────────────────────────────────────────────────────────
 
 

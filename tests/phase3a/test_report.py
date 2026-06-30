@@ -219,7 +219,13 @@ def test_golden_match_within_15min(tmp_path):
 
 
 def test_golden_match_outside_15min(tmp_path):
-    """A trace 16 min away does NOT match."""
+    """A golden entry inside the window but >15 min from any trace does NOT match.
+
+    Two traces (13:30 and 14:16 UTC) bracket the golden entry (14:00 UTC) so it
+    falls inside the backtested window (counted in the denominator), but the
+    nearest trace is 16 min away → not matched. Verifies the ±15 min check,
+    distinct from window-scoping exclusion.
+    """
     golden = [
         {"date": "2026-06-15", "time_et": "10:00", "direction": "long",
          "model": "2022", "ticker": "NQ", "rationale_snippet": "x", "killzone": "ny_am_kz"},
@@ -227,14 +233,50 @@ def test_golden_match_outside_15min(tmp_path):
     golden_path = tmp_path / "golden_alerts.json"
     golden_path.write_text(json.dumps(golden))
 
-    # Trace at 10:16 ET = 14:16 UTC (16 min after 10:00 ET = 14:00 UTC).
-    trace_ts = datetime(2026, 6, 15, 14, 16, tzinfo=timezone.utc).isoformat()
+    # Golden at 14:00 UTC. Traces at 13:30 (30 min before) and 14:16 (16 min
+    # after) → window [13:15, 14:31] contains 14:00, but neither trace is
+    # within 15 min.
+    traces = [
+        _trace(datetime(2026, 6, 15, 13, 30, tzinfo=timezone.utc).isoformat(),
+               "long", result="win", actual_rr=2.0),
+        _trace(datetime(2026, 6, 15, 14, 16, tzinfo=timezone.utc).isoformat(),
+               "long", result="win", actual_rr=2.0),
+    ]
+
+    report = PerformanceReport()
+    md = report.generate(traces, golden_alerts_path=golden_path,
+                         out_path=tmp_path / "report.md")
+    assert "Total directional golden entries (within backtest window): 1" in md
+    assert "Match rate: 0.0%" in md
+
+
+def test_golden_entry_outside_window_excluded(tmp_path):
+    """A golden entry outside the backtested window is excluded from the denominator.
+
+    The window denominator is what fixes the structurally-near-zero rate: a
+    golden entry from a different day than anything backtested should not dilute
+    the match rate.
+    """
+    golden = [
+        # In-window (matches the trace below).
+        {"date": "2026-06-15", "time_et": "10:00", "direction": "long",
+         "model": "2022", "ticker": "NQ", "rationale_snippet": "x", "killzone": "ny_am_kz"},
+        # Far out of window (a year earlier) — must be excluded entirely.
+        {"date": "2025-06-15", "time_et": "10:00", "direction": "long",
+         "model": "2022", "ticker": "NQ", "rationale_snippet": "y", "killzone": "ny_am_kz"},
+    ]
+    golden_path = tmp_path / "golden_alerts.json"
+    golden_path.write_text(json.dumps(golden))
+
+    trace_ts = datetime(2026, 6, 15, 14, 5, tzinfo=timezone.utc).isoformat()
     traces = [_trace(trace_ts, "long", result="win", actual_rr=2.0)]
 
     report = PerformanceReport()
     md = report.generate(traces, golden_alerts_path=golden_path,
                          out_path=tmp_path / "report.md")
-    assert "Match rate: 0.0%" in md
+    # Only the in-window entry counts → 1 total, 1 matched, 100%.
+    assert "Total directional golden entries (within backtest window): 1" in md
+    assert "Match rate: 100.0%" in md
 
 
 def test_golden_match_wrong_direction(tmp_path):
@@ -254,6 +296,52 @@ def test_golden_match_wrong_direction(tmp_path):
     md = report.generate(traces, golden_alerts_path=golden_path,
                          out_path=tmp_path / "report.md")
     assert "Match rate: 0.0%" in md
+
+
+def test_golden_match_with_naive_trace_timestamp(tmp_path):
+    """A trace timestamp without a UTC offset does not crash golden matching.
+
+    Regression: subtracting a naive trace_ts from the aware golden_ts used to
+    raise TypeError and abort generate(). Naive timestamps are now read as ET.
+    """
+    golden = [
+        {"date": "2026-06-15", "time_et": "10:00", "direction": "long",
+         "model": "2022", "ticker": "NQ", "rationale_snippet": "x", "killzone": "ny_am_kz"},
+    ]
+    golden_path = tmp_path / "golden_alerts.json"
+    golden_path.write_text(json.dumps(golden))
+
+    # Naive ET timestamp (no offset) 10:05 ET, 5 min after the golden 10:00 ET.
+    trace_ts = "2026-06-15T10:05:00"  # naive — interpreted as ET
+    traces = [_trace(trace_ts, "long", result="win", actual_rr=2.0)]
+
+    report = PerformanceReport()
+    md = report.generate(traces, golden_alerts_path=golden_path,
+                         out_path=tmp_path / "report.md")
+    assert "Match rate: 100.0%" in md
+
+
+def test_golden_match_time_et_with_seconds(tmp_path):
+    """A golden time_et that already carries seconds is parsed, not mangled.
+
+    Regression: the parser unconditionally appended ':00', turning '10:00:30'
+    into invalid ISO that was silently dropped from the numerator.
+    """
+    golden = [
+        {"date": "2026-06-15", "time_et": "10:00:30", "direction": "long",
+         "model": "2022", "ticker": "NQ", "rationale_snippet": "x", "killzone": "ny_am_kz"},
+    ]
+    golden_path = tmp_path / "golden_alerts.json"
+    golden_path.write_text(json.dumps(golden))
+
+    # 10:00:30 ET = 14:00:30 UTC; trace 5 min later still within the window.
+    trace_ts = datetime(2026, 6, 15, 14, 5, tzinfo=timezone.utc).isoformat()
+    traces = [_trace(trace_ts, "long", result="win", actual_rr=2.0)]
+
+    report = PerformanceReport()
+    md = report.generate(traces, golden_alerts_path=golden_path,
+                         out_path=tmp_path / "report.md")
+    assert "Match rate: 100.0%" in md
 
 
 def test_golden_untrusted_data_treated_as_data(tmp_path):
@@ -290,7 +378,7 @@ def test_golden_no_file(tmp_path):
     report = PerformanceReport()
     md = report.generate(traces, golden_alerts_path=tmp_path / "nonexistent.json",
                          out_path=tmp_path / "report.md")
-    assert "Total directional golden entries: 0" in md
+    assert "Total directional golden entries (within backtest window): 0" in md
 
 
 # ── Breakdowns ────────────────────────────────────────────────────────────────

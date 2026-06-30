@@ -40,6 +40,12 @@ _GATE_KEYS = ("no_killzone", "no_htf_bias", "no_dol", "cooldown_active", "no_sof
 _SOFT_KEYS = ("fvg", "ifvg", "sweep", "displacement")
 # Killzone keys.
 _KZ_KEYS = ("london_kz", "ny_am_kz", "ny_pm_kz")
+# Session-level keys — matches detect_session_levels output.
+_SESSION_LEVEL_KEYS = (
+    "midnight_open", "true_day_open", "london_open", "open_830", "open_930",
+    "asia_high", "asia_low", "london_high", "london_low",
+    "nyam_high", "nyam_low", "nylunch_high", "nylunch_low", "nypm_high", "nypm_low",
+)
 
 
 @dataclass
@@ -50,7 +56,16 @@ class CalibrationReport:
     total_1m_candles: int = 0
     gate_blocks: dict = field(default_factory=lambda: {k: 0 for k in _GATE_KEYS})
     soft_triggers: dict = field(default_factory=lambda: {k: 0 for k in _SOFT_KEYS})
+    # Counts how often each structure is present on candles that cleared all hard
+    # gates, regardless of which structure fired first. Useful because the first-
+    # match priority in TriggerEngine means sweep/displacement can never win once
+    # FVGs have accumulated — this counter shows whether the detectors are working.
+    structures_present: dict = field(default_factory=lambda: {k: 0 for k in _SOFT_KEYS})
     fires_by_killzone: dict = field(default_factory=lambda: {k: 0 for k in _KZ_KEYS})
+    # How often a sweep structure (in recent_sweeps["5m"] or ["15m"]) is present
+    # when that specific session level appears in session_levels, on candles that
+    # cleared all hard gates. Tracks which price levels are most swept.
+    sweeps_by_session: dict = field(default_factory=lambda: {k: 0 for k in _SESSION_LEVEL_KEYS})
     fires_by_month: dict = field(default_factory=dict)
     total_fires: int = 0
     estimated_llm_cost_usd: float = 0.0
@@ -61,6 +76,8 @@ class CalibrationReport:
             "total_1m_candles": self.total_1m_candles,
             "gate_blocks": self.gate_blocks,
             "soft_triggers": self.soft_triggers,
+            "structures_present": self.structures_present,
+            "sweeps_by_session": self.sweeps_by_session,
             "fires_by_killzone": self.fires_by_killzone,
             "fires_by_month": self.fires_by_month,
             "total_fires": self.total_fires,
@@ -117,6 +134,14 @@ class TriggerCalibrator:
                     report.gate_blocks.get(result.reason, 0) + 1
                 )
 
+            # Count each structure independently on candles that cleared all
+            # hard gates (should_trigger OR no_soft_trigger). This is separate
+            # from soft_triggers, which only records the winning trigger due to
+            # first-match priority — so sweep/displacement would appear as 0
+            # once FVGs accumulate even though the detectors are finding them.
+            if result.should_trigger or result.reason == "no_soft_trigger":
+                self._count_structures(report, snapshot)
+
         report.period = {"start": first_ts or "", "end": last_ts or ""}
         report.estimated_llm_cost_usd = round(report.total_fires * 0.003, 4)
 
@@ -151,6 +176,48 @@ class TriggerCalibrator:
         bias = "long" if snapshot.htf_bias == "bullish" else "short"
         alert = AlertPayload(bias=bias, killzone=kz or "")
         self.cooldown.update(alert, snapshot)
+
+    def _count_structures(self, report: CalibrationReport, snapshot) -> None:
+        """Increment structures_present for every soft trigger condition that
+        holds, independent of priority order, and tally sweeps_by_session.
+
+        Uses TriggerEngine.soft_triggers_present as the single source of truth,
+        so a new soft trigger added to the engine is counted here automatically
+        (no silent drift)."""
+        present = self.trigger.soft_triggers_present(snapshot)
+        for name, is_present in present.items():
+            if is_present and name in report.structures_present:
+                report.structures_present[name] += 1
+        if present.get("sweep"):
+            self._count_sweeps_by_session(report, snapshot)
+
+    @staticmethod
+    def _count_sweeps_by_session(report: CalibrationReport, snapshot) -> None:
+        """Tally which session levels were actually swept on this candle.
+
+        For each sweep in the recent 5m/15m window, match its ``swept_level``
+        price against the snapshot's session levels (within a relative
+        tolerance) and increment the matching session-level keys. This counts
+        the level the price ran — not merely which levels happened to be
+        defined — so the breakdown reflects real sweep targets."""
+        sl = snapshot.session_levels or {}
+        sweeps = (snapshot.recent_sweeps.get("15m") or []) + (snapshot.recent_sweeps.get("5m") or [])
+        if not sweeps:
+            return
+        matched: set[str] = set()  # one increment per key per candle
+        for sweep in sweeps:
+            level = sweep.get("swept_level")
+            if level is None:
+                continue
+            for key in _SESSION_LEVEL_KEYS:
+                val = sl.get(key)
+                if val is None or key in matched:
+                    continue
+                # Relative tolerance (0.05% of the level), mirroring the
+                # confluence band used in SnapshotBuilder._build_pools.
+                if abs(level - val) <= abs(val) * 0.0005:
+                    report.sweeps_by_session[key] = report.sweeps_by_session.get(key, 0) + 1
+                    matched.add(key)
 
     @staticmethod
     def _month_key(ts) -> str:

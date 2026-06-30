@@ -89,6 +89,21 @@ class KyrosAgentLoader:
             "final_system_prompt": system_prompt,
         }
 
+    def get_model_engine(self, role: str, fallback_role: str | None = None) -> dict:
+        """Return the infrastructure (provider/model/temperature) block for a role.
+
+        Unlike ``get_agent_config``, this does NOT require a prompt registered
+        in prompts.yaml — it's for compute consumers (e.g. the trading reasoning
+        agent) that supply their own system prompt and only need the model
+        config. If ``role`` has no infrastructure block and ``fallback_role`` is
+        given, the fallback role's block is returned instead.
+        """
+        infrastructure = self.load_state().get("infrastructure", {})
+        engine = infrastructure.get(role)
+        if not engine and fallback_role is not None:
+            engine = infrastructure.get(fallback_role)
+        return engine or {}
+
     # -------------------------------------------------------------------
     # Round-tracking helpers. Centralizing these here keeps evaluator retry
     # bookkeeping consistent rather than scattering raw state-file reads and

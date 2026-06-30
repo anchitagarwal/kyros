@@ -19,13 +19,22 @@ producing an incorrect (and optimistic) outcome. The test
 Resolution rules
 ----------------
 1. no_trade → immediate return, all numeric fields None.
-2. Fill: iterate subsequent_candles until the candle's price range overlaps
-   the entry_zone. fill_price = entry_mid = (entry_zone[0]+entry_zone[1])/2.
-3. Resolution begins on the candle AFTER the fill candle (the fill candle
+2. Pre-fill invalidation (cancel): while waiting for a fill, if price reaches
+   the target (the targeted move happened without us) or breaches the stop
+   (the invalidation level traded through) before the entry_zone fills, the
+   setup is cancelled — no trade is taken. Conservative: a candle that tags
+   target/stop AND overlaps the entry_zone in the same bar cancels rather than
+   fills, so this check PRECEDES the fill check. Long: high >= target or
+   low <= stop. Short: low <= target or high >= stop.
+3. Fill: iterate subsequent_candles until the candle's price range overlaps
+   the entry_zone. fill_price = entry_mid = (entry_zone[0]+entry_zone[1])/2,
+   clamped to the fill candle's [low, high] so an edge-graze fill never uses a
+   price the bar never traded.
+4. Resolution begins on the candle AFTER the fill candle (the fill candle
    itself never resolves). Long win: high >= target. Long loss: low <= stop.
    Short win: low <= target. Short loss: high >= stop. Both in the same
    candle → loss (conservative).
-4. Killzone expiry: compare each candle's timestamp against alert.valid_until.
+5. Killzone expiry: compare each candle's timestamp against alert.valid_until.
    No fill by valid_until → no_fill. Filled but unresolved by valid_until →
    expired.
 
@@ -37,7 +46,7 @@ actual_rr
 - Loss: negative of the same formula. exit_price is the REALIZED stop-out: a
         clean intrabar stop fills at alert.stop (exactly -1.0); a gap through
         the stop fills at the candle open (worse than -1.0).
-- no_fill / no_trade / expired → None.
+- no_fill / no_trade / expired / cancelled → None.
 
 Pure function of (alert, candles): no I/O, no clock, no randomness, no LLM.
 """
@@ -57,16 +66,17 @@ class TradeOutcome:
     """The resolved outcome of a single alert.
 
     Fields:
-        result: "win" | "loss" | "expired" | "no_fill" | "no_trade"
+        result: "win" | "loss" | "expired" | "cancelled" | "no_fill" | "no_trade"
         candles_to_fill: 1-based count of candles from the alert until fill
             (None if no fill / no_trade).
         candles_to_resolution: 1-based count of candles from the alert until
             resolution (None if not resolved).
-        fill_price: the entry_mid at which the trade filled (None if no fill).
+        fill_price: the price at which the trade filled — entry_mid clamped to
+            the fill candle's [low, high] range (None if no fill).
         exit_price: the price at which the trade resolved (target for win,
             realized stop for loss; None if not resolved).
         actual_rr: realized risk-reward (positive for win, negative for loss;
-            None for no_fill / no_trade / expired).
+            None for no_fill / no_trade / expired / cancelled).
     """
 
     result: str
@@ -133,6 +143,7 @@ class OutcomeSimulator:
         target = float(alert.target)
         entry_mid = (entry_low + entry_high) / 2.0
         risk = abs(entry_mid - stop)
+        is_long = alert.bias == "long"
 
         # Parse valid_until once (empty string → no expiry).
         valid_until_dt = self._parse_valid_until(alert.valid_until)
@@ -149,6 +160,20 @@ class OutcomeSimulator:
 
             c_low = float(candle["low"])
             c_high = float(candle["high"])
+
+            # Pre-fill invalidation (cancel): if price reaches the target (the
+            # targeted move happened without us) or breaches the stop (the
+            # invalidation level traded through) before the entry_zone fills,
+            # the setup is cancelled — no trade taken. Conservative: a candle
+            # that tags target/stop AND overlaps the entry_zone in the same bar
+            # cancels rather than fills, so this precedes the fill check.
+            if is_long:
+                invalidated = c_high >= target or c_low <= stop
+            else:
+                invalidated = c_low <= target or c_high >= stop
+            if invalidated:
+                return TradeOutcome(result="cancelled")
+
             # Fill: price range overlaps entry_zone.
             # Long fill: candle.low <= entry_zone[1] and candle.high >= entry_zone[0]
             # Short fill: same condition (range overlap).
@@ -163,11 +188,17 @@ class OutcomeSimulator:
             # set, also no_fill (ran out of data without filling).
             return TradeOutcome(result="no_fill")
 
-        fill_price = entry_mid
+        # Fill at entry_mid, but clamp to the fill candle's actual range: if the
+        # candle only grazes a zone edge, entry_mid can lie outside [low, high]
+        # — a price the market never traded on that bar. Clamping yields the
+        # worst achievable fill within the candle (conservative in both
+        # directions: a higher entry for longs, a lower entry for shorts).
+        fill_candle = subsequent_candles[fill_index]
+        fill_price = max(float(fill_candle["low"]),
+                         min(float(fill_candle["high"]), entry_mid))
         candles_to_fill = fill_index + 1  # 1-based count from alert
 
         # ── Step 2: resolution (from candle AFTER fill candle) ──────────────
-        is_long = alert.bias == "long"
         for j in range(fill_index + 1, len(subsequent_candles)):
             candle = subsequent_candles[j]
             c_ts = _parse_ts(candle["timestamp"])

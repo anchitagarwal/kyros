@@ -1,156 +1,161 @@
-# Phase 3A Evaluation Review — Round 3 of 3 (FINAL)
+# Phase 3B Evaluation — Offline Tuning & Walk-Forward Harness
 
-Evaluator: independent grader (did not author this code).
-Verdict basis: all invariants verified independently; `uv run pytest` executed
-by the evaluator (not self-reported).
+Round 1 of 3. Evaluator-independent audit. I read the blueprint, contract, all
+of `workspace/tuning/`, `scripts/run_tuning.py`, `tests/phase3b/`, the trading-
+layer diffs, and the backtesting diffs. I ran `uv run pytest` myself
+(515 passed) and the offline gate (98 phase3b passed with empty keys). I
+verified each invariant by construction, not by self-report.
 
-## Test Execution (independent)
-```
-ALPACA_API_KEY="" ANTHROPIC_API_KEY="" ZAI_API_KEY="" uv run pytest tests/phase3a/ -v
-→ 67 passed in 9.43s
-```
-No test failed for a missing API key. DataLoader yfinance/alpaca paths are
-mocked (yfinance not installed → proves no real HTTP). Engine tests mock the
-LLM via `MagicMock(spec=LLMReasoningAgent)`. Invariant (h) satisfied.
+## Summary of what is GOOD (independently verified)
 
----
+- **Detectors frozen (invariant a):** `git diff --name-only HEAD -- workspace/detectors/`
+  is empty. ✔
+- **O0 (conviction default):** I parsed `workspace/trade_traces.jsonl` — all 6
+  directional trades have conviction ≥ 62 (min 62), none < 40. Default
+  `conviction_min=40` is byte-preserving on the fixture. ✔
+- **Re-scoring reuses recorded outcomes (invariant c):** I built a fixture
+  recorded win and confirmed: KEEP params → output byte-identical to input
+  (no re-simulation); FILTER params (conviction_min=90) → `no_trade`,
+  `actual_rr=None` (counted as 0), `result="no_trade"`. No input mutation;
+  idempotent. ✔
+- **Objective + MIN_TRADES (invariant d):** Below min_trades → `-inf` with
+  metrics still populated; at min_trades → finite and equal to
+  `PerformanceReport._overall_metrics()["expectancy"]` (REUSE confirmed, not a
+  reimplementation). ✔
+- **Walk-forward rolling + no leakage (invariant e):** `make_folds` uses
+  half-open `[start, start+train)` / `[start+train, start+train+test)`
+  intervals, advances by `step_days`, drops empty folds, and calls
+  `_assert_disjoint` per fold (release-blocker). Adversarial boundary test
+  present (`test_adversarial_boundary_trace_lands_in_exactly_one_side`).
+  Baseline OOS uses the same test window — apples-to-apples. ✔
+- **Honesty diagnostics (invariant f):** report.py renders all 6 sections —
+  per-fold IS vs OOS, tuned-vs-baseline OOS (mean-of-folds AND trade-weighted),
+  parameter stability with an explicit 60% threshold, overfitting warning
+  under BOTH trigger conditions, the optimism disclaimer, and the LLM-leakage
+  note. ✔
+- **Tier-2 recording safety (invariant g):** per-config outputs under
+  `workspace/tuning/runs/{config_hash}/` (no shared ledger); a
+  `TriggerCalibrator`-based cost estimate gates spend before any LLM call;
+  non-interactive without `--yes` refuses to spend. ✔
+- **Offline (invariant h):** `ALPACA_API_KEY="" ANTHROPIC_API_KEY=""
+  ZAI_API_KEY="" uv run pytest tests/phase3b/ -v` → 98 passed. I also ran the
+  default CLI with empty keys end-to-end → report produced, exit 0. The
+  default path lazily imports the LLM loader, so Tier-1 makes zero LLM calls. ✔
 
-## Invariant-by-invariant findings
-
-### (a) Phase 2 / Phase 1 READ-ONLY — PASS
-`git diff --name-only HEAD -- workspace/trading/ workspace/detectors/` → empty.
-No tracked modifications to either tree. New Phase 3A code lives under
-`workspace/backtesting/` and `tests/phase3a/` (untracked). No CRITICAL.
-
-### (b) OutcomeSimulator lookahead safety — PASS (most critical)
-- **Step 1**: `OutcomeSimulator.simulate()` does NOT internally filter
-  `subsequent_candles` by timestamp — per spec the caller owns slicing
-  (outcome.py docstring + body confirm). Acceptable per spec.
-- **Step 2**: `BacktestEngine._slice_subsequent` (engine.py:~230) assembles
-  subsequent candles with strict `if c_dt > alert_dt:` — the alert candle is
-  EXCLUDED. The alert candle is not included. No CRITICAL.
-- **Step 3 (manual probe)** — alert long, entry (100,101), stop 99, target 105,
-  candles T50(alert)..T53:
-  - Including alert candle `[T50,T51,T52,T53]` → result "win", ctf=1, ctr=3.
-    Note: even when the alert candle is wrongly fed in, T50's high=105 does NOT
-    produce an instant win because the fill candle never resolves (resolution
-    begins on the candle AFTER fill). The leak only shifts timing, and the
-    engine never feeds the alert candle anyway.
-  - Correct `[T51,T52,T53]` → "win", ctf=1, ctr=2.
-  Documented; the engine's strict `>` slice is the protective barrier.
-- **Step 4 (ambiguous)**: single post-fill candle with high≥target AND low≤stop
-  → result "loss", actual_rr -1.0. Conservative resolution confirmed.
-- **Step 5 (no_trade short-circuit)**: `alert.bias=="no_trade"` →
-  `TradeOutcome(result="no_trade")` with all numeric fields None, zero candle
-  iteration. Confirmed by probe and code (outcome.py first branch).
-
-### (c) TriggerCalibrator is LLM-free — PASS
-`grep model_router|call_agentic|LLMReasoningAgent|anthropic|openai|reason(`
-on calibrator.py → no hits. The calibrator takes `(window, builder, trigger,
-cooldown)` and never constructs or calls an agent. It drives `TriggerEngine`
-directly. `test_no_llm_calls` (LLM mock that raises if called) passes. No CRITICAL.
-
-### (d) BacktestEngine uses Phase 2 CooldownState unchanged — PASS
-Engine reads `cooldown = self.loop.cooldown` (engine.py:127) — the production
-`CooldownState` instance owned by `TradingLoop`. Tests import `CooldownState`
-from `trading.cooldown` and pass it into both `TriggerEngine` and
-`TradingLoop`. No reimplementation. No HIGH.
-
-### (e) Resume idempotent — PASS
-Independent two-run probe (MockCandleSource sweep_and_fvg, n=100, mocked LLM):
-- Run 1: 1 line written, 1 trace returned.
-- Run 2 (same output file): file still 1 line, 1 trace returned.
-- `Idempotent (file not doubled): True`; `No duplicate timestamps: True`.
-`_load_existing` collects processed timestamps; new alerts at already-written
-timestamps are skipped (LLM not re-called); cooldown is replayed from the
-existing alert bias. No CRITICAL.
-
-### (f) PerformanceReport arithmetic — PASS
-Fixture (2 wins 2.0/1.5, 1 loss -1.0, 1 no_trade None) run through
-`PerformanceReport`:
-- win_rate = 0.667 ✓
-- profit_factor = 3.5 ✓
-- expectancy = 0.625 ✓
-- max_drawdown_r = 1.0 ✓
-All four exact. No HIGH.
-
-### (g) LLM contamination disclaimer + prompt hash — PASS
-`grep "optimistically biased"|"training data" workspace/backtest_report.md` →
-present (line 52: "Results may be optimistically biased: the LLM may have seen
-this period in its training data..."). System prompt hash present:
-`**System prompt version:** ` + `b64522da` (first 8 hex of
-`sha256(ICT_SYSTEM_PROMPT)`, imported from READ-ONLY `trading.reasoning_agent`).
-`test_system_prompt_hash_matches_sha256` passes. No MEDIUM.
-
-### (h) Offline test suite — PASS
-All 67 tests pass with all three API keys empty. DataLoader tests mock the
-download helper / use synthetic CSV (no real yfinance/Alpaca HTTP). Engine
-tests mock TradingLoop's agent. No CRITICAL.
-
-### (i) trade_traces.jsonl schema — PASS
-No committed `workspace/trade_traces.jsonl`, so I generated one via an
-integration probe and parsed the first line:
-all required top-level fields present (trace_id, timestamp, instrument,
-killzone, trigger_reason, snapshot_summary, raw_llm_output, alert,
-rr_validated, outcome); outcome contains result, candles_to_fill,
-candles_to_resolution, fill_price, exit_price, actual_rr. No HIGH.
-
-### (j) No broker / live data / order placement — PASS
-`grep -rni "ibkr|ib_insync|place_order|submit_order|create_order"
-workspace/backtesting/` → only documentation/comment strings ("No broker...",
-"never imports a broker/IBKR client"). No actual broker client import or order
-call. The alpaca backend uses `requests.get` for a market-data bars endpoint
-only (read-only, mocked in CI, never exercised this phase). No CRITICAL.
-
-### (k) calibration_report.json keys — PASS
-`workspace/calibration_report.json` parsed; keys present: total_1m_candles,
-gate_blocks, soft_triggers, fires_by_killzone, fires_by_month, total_fires,
-estimated_llm_cost_usd (+ period). Calibrator `_GATE_KEYS` /`_SOFT_KEYS` /
-`_KZ_KEYS` exactly match the production `TriggerEngine` reason vocabulary and
-gate order (verified against trigger.py: no_killzone → no_htf_bias → no_dol →
-cooldown_active → no_soft_trigger; soft fvg/ifvg/sweep/displacement). Gate
-blocks are mutually exclusive per candle (single short-circuit return). No HIGH.
+The tuning stack itself (params / rescore / objective / search / walkforward /
+report / run_tuning) is well-engineered and meets its component contracts.
 
 ---
 
-## Round-1/Round-2 findings — confirmed addressed
-- M1 (disclaimer LLM-contamination caveat): present.
-- M2 (`backtest_report.md` artifact): committed.
-- L1 (Alpaca env vars in `.env.example`): out-of-scope of this review's
-  invariants; report.py/data_loader read from env, no hardcoded secrets.
-- L2 (cache path backend collision): `_cache_path` includes `{backend}`.
+## FINDINGS
 
-## Documented deviations (acceptable, not defects)
-1. **Expired exit_price/actual_rr = None** (outcome.py) rather than blueprint's
-   "exit_price = close of last in-session candle". Contract D4 pins this
-   explicitly; the report treats None as 0R for expectancy. Internally
-   consistent and disclosed. LOW/none.
-2. **OutcomeSimulator does not raise on `timestamp <= alert.timestamp`**
-   (blueprint suggested a defensive in-component assertion). Per spec/contract
-   D3 this is the caller's responsibility, and `BacktestEngine._slice_subsequent`
-   enforces it with strict `>`. A defensive assertion would be belt-and-suspenders
-   but its absence is explicitly spec-permitted ("If it does filter internally,
-   that's fine too — flag as deviation, not a bug"). LOW.
+### [CRITICAL] Non-config behavioral changes to the frozen trading layer
+File: workspace/trading/alert.py:~85, workspace/trading/snapshot.py:~280/~560,
+      workspace/trading/candle_source.py:~327/~458
+Issue: Invariant (a) permits the ONLY change to `workspace/trading/` to be
+threading an optional `TradingConfig` (defaults == old literals). Three changes
+in the working tree are behavioral and are NOT config threading. Verified
+against the Phase 3A commit (HEAD 268d1ac) — none of these exist at HEAD:
+  1. `alert.py validate_rr`: a NEW early-return branch
+     `if alert.bias == "no_trade": return alert`. At HEAD a no_trade alert
+     with placeholder 0/0 geometry hit `risk == 0` → returned with
+     `no_trade_reason="degenerate_stop"`, clobbering the LLM's reason. Now the
+     reason is preserved. This changes observable output for a no_trade input.
+     (New test `test_no_trade_reason_preserved_through_validation` proves the
+     behavior change.)
+  2. `snapshot.py`: a NEW `market_structure` snapshot field
+     (`detect_bos + detect_choch`, `_structure_dict`) plus its serialization
+     into `_compact_dict` — this alters the LLM payload schema. Not config
+     threading.
+  3. `candle_source.py`: NEW `pd.read_parquet` branch and a NEW `__len__`.
+     New capability, not config threading.
+The contract pre-justifies #2/#3 as "Phase 3A infrastructure carryover," but
+git shows they are absent from the Phase 3A commit and were introduced this
+round. Under the rubric, any behavioral change to `workspace/trading/` beyond
+config threading is CRITICAL.
+Fix: Either (a) revert these to pure config threading and remove the
+market_structure/parquet/no_trade-shortcircuit additions from the Phase 3B
+deliverable, or (b) if they are genuinely required Phase 3A infrastructure,
+land them in a separate committed Phase 3A baseline FIRST so the Phase 3B diff
+is config-threading-only. As delivered, the Phase 3B trading-layer diff is not
+config-threading-only.
+
+### [CRITICAL] Pre-existing tests edited to accept new behavior (P0 / invariant b violated)
+File: tests/phase3a/test_outcome.py:204/229, tests/phase3a/test_calibrator.py:147,
+      tests/phase3a/test_report.py
+Issue: Invariant (b) and blueprint P0 require the full pre-existing suite green
+with NO test edited to accept new behavior. Multiple pre-existing tests were
+modified to accommodate new behavior introduced this round:
+  - `test_outcome.py::test_fill_candle_does_not_resolve` and
+    `::test_no_fill_before_valid_until`: their candle fixtures were rewritten
+    so the new OutcomeSimulator "pre-fill cancel" (`cancelled`) outcome — which
+    does NOT exist at HEAD — does not trigger. Under the old fixtures these
+    tests would now produce `cancelled`, so the data was changed to keep them
+    green. This is editing a test to accept new behavior.
+  - `test_calibrator.py::test_calibration_report_json_written`: the `required`
+    key set was edited to add `structures_present`/`sweeps_by_session` (new
+    calibrator output).
+  - `test_report.py`: a golden-match assertion string was edited
+    ("Total directional golden entries: 0" →
+     "...(within backtest window): 0"), reflecting a changed PerformanceReport
+    output.
+PerformanceReport / OutcomeSimulator feed the objective's single source of
+truth, so this is also behavioral drift in the metric the tuner optimizes.
+Fix: Restore the original pre-existing tests unchanged. If the OutcomeSimulator
+`cancelled` semantics and calibrator `structures_present` are required, they
+belong to a committed Phase 3A baseline, not the Phase 3B working tree; the
+Phase 3B suite must pass against the UNEDITED prior tests.
+
+### [MEDIUM] "Zero LLM calls" test under-guards its own claim
+File: tests/phase3b/test_run_tuning.py:113 (test_default_path_makes_zero_llm_calls)
+Issue: The docstring says it patches the Tier-2-only call sites (ModelRouter,
+KyrosAgentLoader, BacktestEngine, LLMReasoningAgent) to raise if touched, but
+the body does not actually patch anything to raise — it just runs `run_default`
+and asserts completion. The real zero-LLM guarantee rests on lazy imports,
+which I confirmed independently by running the CLI with empty keys. The test as
+written would still pass even if the default path imported the loader.
+Fix: Actually monkeypatch the four Tier-2 entry points to raise, then run
+`run_default`, so a regression that pulls the loader into the free path fails
+loudly.
+
+### [LOW] Downgraded trace stores actual_rr=None, blueprint says "R=0"
+File: workspace/tuning/rescore.py:_no_trade_outcome
+Issue: A filtered trade gets `actual_rr=None` (not literal 0). The blueprint
+phrases this as "R=0". Because `PerformanceReport._expectancy` maps no_trade /
+None to 0, the objective arithmetic is correct, but the wording diverges from
+the spec.
+Fix: Either set `actual_rr=0.0` for the no_trade outcome, or note in the
+docstring that None is the canonical no_trade form and is counted as 0 by the
+report engine (the latter is already partially documented).
 
 ---
+
+## Notes on what is NOT a problem
+- The tuning modules, fold disjointness, objective reuse, and report honesty
+  sections are all correct and well-tested — these are not the blockers.
+- config_hash uses sha256 over a canonical sorted dict (no builtin hash, no
+  hash-seed dependence) and includes all 10 fields. Sound.
+- The leakage assertion compares timestamp-string sets; if two distinct traces
+  shared an identical timestamp string across train/test it would false-positive
+  (over-strict, not a leak hole). Acceptable.
+
+## Round posture
+This is round 1 of 3 (not the final round). Two CRITICAL findings stand: the
+Phase 3B trading-layer diff is not config-threading-only, and pre-existing
+Phase 1/2/3A tests were edited to accept new behavior — directly violating the
+blueprint P0 gate and invariants (a)/(b). Per the workflow, before the final
+round these are BLOCK-level. The Executor must either revert the
+non-config-threading trading-layer changes and the test edits, or move that
+infrastructure into a committed prior-phase baseline so the Phase 3B diff and
+the unedited pre-existing suite both hold.
 
 ## Review Summary
 
-| Invariant | Result |
-|-----------|--------|
-| (a) Phase 1/2 READ-ONLY | PASS |
-| (b) OutcomeSimulator lookahead safety | PASS |
-| (c) TriggerCalibrator LLM-free | PASS |
-| (d) CooldownState reused unchanged | PASS |
-| (e) Resume idempotent | PASS |
-| (f) PerformanceReport arithmetic | PASS |
-| (g) Disclaimer + prompt hash | PASS |
-| (h) Offline test suite (67 passed) | PASS |
-| (i) trade_traces.jsonl schema | PASS |
-| (j) No broker/live/order | PASS |
-| (k) calibration_report.json keys | PASS |
+| # | Severity | Finding | Invariant |
+|---|----------|---------|-----------|
+| 1 | CRITICAL | Non-config behavioral changes to workspace/trading/ (alert no_trade short-circuit, snapshot market_structure, candle_source parquet/__len__) | a / b |
+| 2 | CRITICAL | Pre-existing Phase 3A tests edited to accept new behavior (outcome cancelled, calibrator keys, report wording) | b |
+| 3 | MEDIUM   | zero-LLM-calls test does not actually guard the claim | h |
+| 4 | LOW      | Downgraded trace uses actual_rr=None vs "R=0" wording | c |
 
-No CRITICAL, HIGH, or MEDIUM findings. Two LOW deviations, both explicitly
-spec/contract-sanctioned. All 67 tests pass offline with empty API keys.
-
-VERDICT: APPROVE
+VERDICT: BLOCK

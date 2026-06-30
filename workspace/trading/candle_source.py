@@ -296,10 +296,12 @@ class MockCandleSource(CandleSource):
 
 
 class ReplayCandleSource(CandleSource):
-    """Replay a 1m OHLCV CSV, resampled to all 5 timeframes via pandas.
+    """Replay a 1m OHLCV source (CSV or parquet), resampled to all 5 timeframes.
 
-    The CSV must have columns: timestamp, open, high, low, close, volume.
-    ``timestamp`` is parsed and localized to America/New_York.
+    The source must have columns: timestamp, open, high, low, close, volume.
+    Files ending in ``.parquet`` are read with ``pd.read_parquet`` (the
+    canonical DataLoader output); anything else is read as CSV. ``timestamp``
+    is parsed and localized to America/New_York.
 
     Resampling uses left-closed, left-labeled bars (the bar's timestamp is its
     OPEN time). Partial trailing bars are dropped — only fully-formed bars are
@@ -325,7 +327,12 @@ class ReplayCandleSource(CandleSource):
         import pandas as pd  # local import: keeps module import cheap
 
         self.tz = ZoneInfo(tz)
-        df = pd.read_csv(path)
+        # Read parquet (canonical DataLoader artifact) or CSV (raw export),
+        # selected by extension so both feed the same replay path.
+        if str(path).endswith(".parquet"):
+            df = pd.read_parquet(path)
+        else:
+            df = pd.read_csv(path)
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert(self.tz)
         df = df.sort_values("timestamp").reset_index(drop=True)
 
@@ -448,3 +455,12 @@ class ReplayCandleSource(CandleSource):
 
     def is_done(self) -> bool:
         return self._1m_idx >= self._n_1m
+
+    def __len__(self) -> int:
+        """Total 1m ticks this source emits — exactly one per ``next()`` call.
+
+        The replay drives off the 1m bars (one per tick until exhausted), so
+        this is the precise iteration count callers can use to size a progress
+        bar / ETA over a full replay.
+        """
+        return self._n_1m

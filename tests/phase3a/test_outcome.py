@@ -204,20 +204,21 @@ def test_ambiguous_same_candle_is_loss():
 def test_fill_candle_does_not_resolve():
     """The fill candle's high/low must NOT be used for resolution.
 
-    The fill candle reaches the target, but resolution must wait for the next
-    candle. Here the next candle does NOT hit target/stop, so the trade is
-    still unresolved (expired) — proving the fill candle was not used.
+    The fill candle fills (but does NOT reach target/stop — that would cancel
+    pre-fill). Resolution must wait for the next candle; here the next candle
+    also has no hit, so the trade is still unresolved (expired) — proving the
+    fill candle was not used to resolve.
     """
     alert = _long_alert(entry_zone=(100.0, 102.0), stop=95.0, target=115.0)
-    # Candle 0: fills AND high=116 >= target 115. But resolution starts at
-    # candle 1. Candle 1 does not hit target or stop → expired.
+    # Candle 0: fills (low=98<=102, high=104>=100); high=104 < target 115 and
+    # low=98 > stop 95 → no pre-fill cancel. Resolution starts at candle 1,
+    # which does not hit target or stop → expired.
     candles = [
-        _candle(_BASE + timedelta(minutes=1), 100, 116, 98, 114),  # fill + target in range
-        _candle(_BASE + timedelta(minutes=2), 114, 114, 100, 110),  # no hit
+        _candle(_BASE + timedelta(minutes=1), 100, 104, 98, 103),  # fill, no target/stop
+        _candle(_BASE + timedelta(minutes=2), 103, 110, 100, 108),  # no hit
     ]
     sim = OutcomeSimulator()
     out = sim.simulate(alert, candles)
-    # NOT a win — the fill candle's high was not used for resolution.
     assert out.result == "expired"
     assert out.fill_price == 101.0
 
@@ -229,14 +230,15 @@ def test_no_fill_before_valid_until():
     """No fill before valid_until → no_fill, actual_rr=None."""
     vu = _BASE + timedelta(minutes=5)
     alert = _long_alert(valid_until=vu.isoformat())
-    # Candles never enter entry_zone (all above 102), and the 5th candle is
-    # at/after valid_until.
+    # Candles never enter entry_zone (all above 102) and never reach target
+    # 115 (highs stay <= 110, so no pre-fill cancel). The 5th candle is
+    # at/after valid_until → no_fill.
     candles = [
-        _candle(_BASE + timedelta(minutes=1), 110, 112, 108, 111),
-        _candle(_BASE + timedelta(minutes=2), 111, 113, 109, 112),
-        _candle(_BASE + timedelta(minutes=3), 112, 114, 110, 113),
-        _candle(_BASE + timedelta(minutes=4), 113, 115, 111, 114),
-        _candle(_BASE + timedelta(minutes=5), 114, 116, 112, 115),  # >= valid_until
+        _candle(_BASE + timedelta(minutes=1), 106, 108, 104, 107),
+        _candle(_BASE + timedelta(minutes=2), 107, 109, 105, 108),
+        _candle(_BASE + timedelta(minutes=3), 108, 110, 106, 109),
+        _candle(_BASE + timedelta(minutes=4), 107, 109, 105, 108),
+        _candle(_BASE + timedelta(minutes=5), 108, 110, 106, 109),  # >= valid_until
     ]
     sim = OutcomeSimulator()
     out = sim.simulate(alert, candles)
@@ -244,6 +246,82 @@ def test_no_fill_before_valid_until():
     assert out.actual_rr is None
     assert out.fill_price is None
     assert out.candles_to_fill is None
+
+
+# ── Pre-fill cancel (target/stop hit before entry) ─────────────────────────────
+
+
+def test_long_cancel_target_before_entry():
+    """Long: price reaches target before the entry zone fills → cancelled."""
+    alert = _long_alert(entry_zone=(100.0, 102.0), stop=95.0, target=115.0)
+    # Candle 0 never enters the zone (low=108 > 102) but high=116 >= target 115
+    # → the targeted move happened without us → cancelled (no fill).
+    candles = [
+        _candle(_BASE + timedelta(minutes=1), 110, 116, 108, 114),
+        _candle(_BASE + timedelta(minutes=2), 101, 101, 100, 100),  # would have filled
+    ]
+    out = OutcomeSimulator().simulate(alert, candles)
+    assert out.result == "cancelled"
+    assert out.fill_price is None
+    assert out.actual_rr is None
+    assert out.candles_to_fill is None
+
+
+def test_short_cancel_target_before_entry():
+    """Short: price reaches target (below) before the entry zone fills → cancelled."""
+    alert = _short_alert(entry_zone=(100.0, 102.0), stop=110.0, target=85.0)
+    # Candle 0 never enters the zone (high=92 < 100) but low=84 <= target 85
+    # → cancelled.
+    candles = [
+        _candle(_BASE + timedelta(minutes=1), 90, 92, 84, 86),
+        _candle(_BASE + timedelta(minutes=2), 101, 102, 100, 101),  # would have filled
+    ]
+    out = OutcomeSimulator().simulate(alert, candles)
+    assert out.result == "cancelled"
+    assert out.fill_price is None
+
+
+def test_long_cancel_stop_before_entry():
+    """Long: price breaches the stop before filling → cancelled (invalidated)."""
+    alert = _long_alert(entry_zone=(100.0, 102.0), stop=95.0, target=115.0)
+    # Candle 0 gaps below: low=94 <= stop 95 → invalidation level traded
+    # through before fill → cancelled. (It also overlaps the zone, but the
+    # conservative cancel check precedes the fill check.)
+    candles = [
+        _candle(_BASE + timedelta(minutes=1), 101, 101, 94, 96),
+        _candle(_BASE + timedelta(minutes=2), 101, 116, 100, 115),
+    ]
+    out = OutcomeSimulator().simulate(alert, candles)
+    assert out.result == "cancelled"
+
+
+def test_cancel_same_candle_target_and_entry_is_conservative():
+    """Target tagged AND entry zone overlapped in the same bar → cancelled.
+
+    Conservative tie-break: we cannot assume we filled before the run to
+    target, so the same-bar overlap cancels rather than fills.
+    """
+    alert = _long_alert(entry_zone=(100.0, 102.0), stop=95.0, target=115.0)
+    # Candle 0: low=100 (fills) AND high=116 >= target 115 → cancelled, not win.
+    candles = [
+        _candle(_BASE + timedelta(minutes=1), 101, 116, 100, 114),
+    ]
+    out = OutcomeSimulator().simulate(alert, candles)
+    assert out.result == "cancelled"
+    assert out.fill_price is None
+
+
+def test_no_cancel_on_normal_fill():
+    """A normal pull-back fill (no target/stop touch) is unaffected by cancel."""
+    alert = _long_alert(entry_zone=(100.0, 102.0), stop=95.0, target=115.0)
+    # Candle 0 fills at 101, no target/stop touch; candle 1 reaches target → win.
+    candles = [
+        _candle(_BASE + timedelta(minutes=1), 103, 104, 100, 101),
+        _candle(_BASE + timedelta(minutes=2), 101, 116, 100, 115),
+    ]
+    out = OutcomeSimulator().simulate(alert, candles)
+    assert out.result == "win"
+    assert out.fill_price == 101.0
 
 
 def test_no_fill_ran_out_of_candles():
@@ -364,14 +442,15 @@ def test_alert_candle_as_subsequent_gives_wrong_outcome():
       - candle B:     no hit.
 
     CORRECT (alert candle excluded, subsequent = [A, B]):
-      A fills (index 0); resolution starts at B (index 1); B has no hit →
-      ran out of candles → EXPIRED.
+      A is the first post-alert candle and reaches target (116 >= 115) before
+      any fill → pre-fill invalidation → CANCELLED (the targeted move happened
+      without us).
 
     WRONG (alert candle prepended, subsequent = [alert, A, B]):
-      alert fills (index 0); resolution starts at A (index 1); A reaches
-      target → WIN.
+      alert fills (index 0; high=110 < target so no pre-fill cancel);
+      resolution starts at A (index 1); A reaches target → WIN.
 
-    The two outcomes DIVERGE (expired vs win) because the alert candle's
+    The two outcomes DIVERGE (cancelled vs win) because the alert candle's
     range was (incorrectly) used for fill detection, shifting the resolution
     window by one bar. The caller MUST exclude the alert candle.
     """
@@ -391,9 +470,9 @@ def test_alert_candle_as_subsequent_gives_wrong_outcome():
     correct_out = sim.simulate(alert, correct)
     wrong_out = sim.simulate(alert, wrong)
 
-    # The correct outcome is expired (A fills, B has no hit, ran out).
-    assert correct_out.result == "expired", (
-        f"expected expired, got {correct_out.result}"
+    # The correct outcome is cancelled (A reaches target before any fill).
+    assert correct_out.result == "cancelled", (
+        f"expected cancelled, got {correct_out.result}"
     )
     # The WRONG outcome is a win (alert fills, A reaches target).
     assert wrong_out.result == "win", (
@@ -417,6 +496,41 @@ def test_idempotence():
     out1 = sim.simulate(alert, candles)
     out2 = sim.simulate(alert, candles)
     assert out1 == out2
+
+
+# ── fill_price clamping ───────────────────────────────────────────────────────
+
+
+def test_fill_price_clamped_to_candle_when_entry_mid_above_high():
+    """A short fill that only grazes the zone bottom fills at the candle high,
+    never at entry_mid (a price the bar never traded)."""
+    # entry_zone [102, 104] → entry_mid 103. Candle grazes the bottom edge:
+    # high=102.1 (>= entry_low 102 → overlap) but never reaches 103.
+    alert = _short_alert(entry_zone=(102.0, 104.0), stop=110.0, target=85.0)
+    candles = [_candle(_BASE + timedelta(minutes=1), 100.0, 102.1, 99.0, 100.0)]
+    out = OutcomeSimulator().simulate(alert, candles)
+    assert out.result == "expired"  # filled, unresolved by end of candles
+    assert out.fill_price == 102.1  # clamped to candle high, not entry_mid 103
+
+
+def test_fill_price_clamped_to_candle_when_entry_mid_below_low():
+    """A long fill that only grazes the zone top fills at the candle low,
+    never below it."""
+    # entry_zone [98, 100] → entry_mid 99. Candle grazes the top edge:
+    # low=100.0 (<= entry_high 100 → overlap) but never trades down to 99.
+    alert = _long_alert(entry_zone=(98.0, 100.0), stop=90.0, target=120.0)
+    candles = [_candle(_BASE + timedelta(minutes=1), 101.0, 103.0, 100.0, 102.0)]
+    out = OutcomeSimulator().simulate(alert, candles)
+    assert out.result == "expired"
+    assert out.fill_price == 100.0  # clamped to candle low, not entry_mid 99
+
+
+def test_fill_price_unclamped_when_entry_mid_inside_candle():
+    """When entry_mid lies inside the fill candle range, fill is entry_mid."""
+    alert = _long_alert(entry_zone=(100.0, 102.0))  # entry_mid 101
+    candles = [_candle(_BASE + timedelta(minutes=1), 100.5, 103.0, 99.0, 100.0)]
+    out = OutcomeSimulator().simulate(alert, candles)
+    assert out.fill_price == 101.0  # inside [99, 103] → unchanged
 
 
 # ── TradeOutcome.to_dict ──────────────────────────────────────────────────────

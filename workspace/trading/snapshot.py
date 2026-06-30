@@ -15,9 +15,20 @@ Key derivation rules (per the module layout spec):
   - fvgs/ifvgs/order_blocks/breaker_blocks/volume_imbalances: all 5 TFs,
     unmitigated/active only.
   - recent_sweeps/displacements/recent_inducements: all 5 TFs, last 10 only.
+  - market_structure: BOS + ChoCH (MSS) breaks merged per TF, all 5 TFs,
+    sorted by break index, last 10 only. Distinct from htf_bias, which
+    collapses 4h/1h breaks into a single directional anchor.
   - premium_discount/recent_swings: all 5 TFs.
 
 Determinism: same window → identical snapshot (no wall-clock, no RNG).
+
+Config threading (Phase 3B): ``SnapshotBuilder`` accepts an optional
+``config: TradingConfig = TradingConfig()``. The confluence band fraction
+(today's ``* 0.001``), per-detector recency caps (the ``[-N:]`` slices), the
+max pools sent to the LLM (today's ``[:5]``), the HTF timeframe order
+(today's ``("4h", "1h")``), and the killzone windows (today's ``_KILLZONES``)
+are read from config. With the default config, behavior is byte-identical to
+pre-change code.
 """
 
 from __future__ import annotations
@@ -27,6 +38,7 @@ from datetime import datetime, time
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from .config import TradingConfig
 
 def _parse_dt(ts: Any) -> datetime:
     """Parse a timestamp (datetime or ISO-8601 str) to an aware datetime."""
@@ -66,6 +78,8 @@ TZ = "America/New_York"
 _NY = ZoneInfo(TZ)
 
 # Killzone windows (clock times in ET), matching sessions.py defaults.
+# Kept as a module constant for backward compatibility; SnapshotBuilder now
+# reads killzone windows from its config (default == this list).
 _KILLZONES = [
     ("london_kz", time(2, 0), time(5, 0)),
     ("ny_am_kz", time(9, 30), time(11, 0)),
@@ -80,17 +94,27 @@ def _in_window(local_dt: datetime, start: time, end: time) -> bool:
     return t >= start or t < end
 
 
-def _killzone_at(dt: datetime) -> str | None:
-    """Return the killzone name containing ``dt`` (ET), or None."""
+def _killzone_at(dt: datetime, killzones) -> str | None:
+    """Return the killzone name containing ``dt`` (ET), or None.
+
+    ``killzones`` is a list of (name, start_time, end_time) tuples (the shape
+    produced by ``TradingConfig.killzone_windows_list()``). Defaults to the
+    module-level ``_KILLZONES`` for backward compatibility with any caller
+    that invokes the free function directly.
+    """
     local = dt.astimezone(_NY)
-    for name, start, end in _KILLZONES:
+    for name, start, end in killzones:
         if _in_window(local, start, end):
             return name
     return None
 
 
 def _session_at(dt: datetime) -> str | None:
-    """Return the session name containing ``dt`` (ET), or None."""
+    """Return the session name containing ``dt`` (ET), or None.
+
+    Sessions are detector defaults (sessions.py), not trading knobs, so they
+    are NOT part of TradingConfig — this helper stays a free function.
+    """
     local = dt.astimezone(_NY)
     sessions = [
         ("asian", time(20, 0), time(0, 0)),
@@ -147,6 +171,7 @@ class MarketSnapshot:
     htf_bias: str | None  # "bullish" | "bearish" | None
     htf_bias_source: dict | None  # {timeframe, type, index, timestamp}
     recent_swings: dict[str, list[dict]]
+    market_structure: dict[str, list[dict]]  # BOS + ChoCH (MSS) breaks per TF
     premium_discount: dict[str, list[dict]]
     # Entry structures (per TF, active/unmitigated only)
     fvgs: dict[str, list[dict]]
@@ -164,6 +189,10 @@ class MarketSnapshot:
     # DOL
     all_pools: list[LiquidityPool]
     nearest_dol: LiquidityPool | None
+    # Max pools serialized to the LLM (from config; default 5 == today's [:5]).
+    # Carried on the snapshot so the config-free _compact_dict serializer can
+    # honor a non-default pools_to_llm without a builder reference.
+    pools_to_llm: int = 5
 
     def to_compact_dict(self) -> dict:
         """LLM payload: excludes raw candle lists, keeps summaries/levels only.
@@ -179,11 +208,25 @@ class MarketSnapshot:
 
 
 class SnapshotBuilder:
-    """Run all detectors across all timeframes and assemble a MarketSnapshot."""
+    """Run all detectors across all timeframes and assemble a MarketSnapshot.
 
-    def __init__(self, instrument: str = "NQ", tz: str = TZ):
+    Args:
+        instrument: the instrument label (default "NQ").
+        tz: the display timezone (default America/New_York).
+        config: trading config (defaults reproduce today's behavior exactly).
+            The confluence band, per-detector recency caps, max pools to the
+            LLM, HTF timeframe order, and killzone windows are read from
+            config.
+    """
+
+    def __init__(self, instrument: str = "NQ", tz: str = TZ,
+                 config: TradingConfig = TradingConfig()):
         self.instrument = instrument
         self.tz = tz
+        self.config = config
+        # Pre-resolve the config views once (immutable; safe to cache).
+        self._recency_caps = config.recency_caps_dict()
+        self._killzones = config.killzone_windows_list()
 
     def build(self, window, now: datetime | None = None) -> MarketSnapshot:
         """Build a snapshot from ``window`` (a CandleWindow).
@@ -206,7 +249,7 @@ class SnapshotBuilder:
         current_price = candles_by_tf.get("1m", [{}])[-1].get("close", 0.0) if candles_by_tf.get("1m") else 0.0
 
         # Session + killzone.
-        kz = _killzone_at(now_dt)
+        kz = _killzone_at(now_dt, self._killzones)
         sess = _session_at(now_dt)
 
         # Session levels (from 1m candles — a single trading day's worth).
@@ -217,6 +260,7 @@ class SnapshotBuilder:
 
         # Per-TF detector runs.
         recent_swings: dict[str, list[dict]] = {}
+        market_structure: dict[str, list[dict]] = {}
         premium_discount: dict[str, list[dict]] = {}
         fvgs: dict[str, list[dict]] = {}
         ifvgs: dict[str, list[dict]] = {}
@@ -232,14 +276,21 @@ class SnapshotBuilder:
         for tf in TIMEFRAMES:
             candles = candles_by_tf[tf]
             if not candles:
-                for d in (recent_swings, premium_discount, fvgs, ifvgs, order_blocks,
-                          breaker_blocks, volume_imbalances, opening_gaps,
-                          recent_sweeps, displacements, recent_inducements, po3_phase):
+                for d in (recent_swings, market_structure, premium_discount, fvgs,
+                          ifvgs, order_blocks, breaker_blocks, volume_imbalances,
+                          opening_gaps, recent_sweeps, displacements,
+                          recent_inducements, po3_phase):
                     d[tf] = []
                 continue
 
             swings = detect_swings(candles)
-            recent_swings[tf] = [_swing_dict(s) for s in swings[-5:]]
+            recent_swings[tf] = [_swing_dict(s) for s in swings[-self._cap("recent_swings", 5):]]
+
+            # Market structure: BOS (continuation) + ChoCH (MSS / reversal),
+            # merged and ordered by the confirming candle, last 10.
+            breaks = detect_bos(candles) + detect_choch(candles)
+            breaks.sort(key=lambda b: b["break_index"])
+            market_structure[tf] = [_structure_dict(b) for b in breaks[-self._cap("market_structure", 10):]]
 
             pd = detect_premium_discount(candles)
             premium_discount[tf] = [_pd_dict(p) for p in pd]
@@ -247,31 +298,31 @@ class SnapshotBuilder:
             # FVGs: keep all (active = not yet filled; detect_fvg emits all
             # confirmed gaps; we keep the most recent 5 for compactness).
             fvg_list = detect_fvg(candles)
-            fvgs[tf] = [_fvg_dict(f) for f in fvg_list[-5:]]
+            fvgs[tf] = [_fvg_dict(f) for f in fvg_list[-self._cap("fvgs", 5):]]
 
-            ifvgs[tf] = [_ifvg_dict(f) for f in detect_ifvg(candles)[-5:]]
+            ifvgs[tf] = [_ifvg_dict(f) for f in detect_ifvg(candles)[-self._cap("ifvgs", 5):]]
 
             obs = detect_order_blocks(candles)
             # Active = unmitigated.
-            order_blocks[tf] = [_ob_dict(o) for o in obs if not o.get("mitigated")][-5:]
+            order_blocks[tf] = [_ob_dict(o) for o in obs if not o.get("mitigated")][-self._cap("order_blocks", 5):]
 
-            breaker_blocks[tf] = [_breaker_dict(b) for b in detect_breaker_blocks(candles)[-5:]]
+            breaker_blocks[tf] = [_breaker_dict(b) for b in detect_breaker_blocks(candles)[-self._cap("breaker_blocks", 5):]]
 
-            volume_imbalances[tf] = [_vi_dict(v) for v in detect_volume_imbalance(candles)[-5:]]
+            volume_imbalances[tf] = [_vi_dict(v) for v in detect_volume_imbalance(candles)[-self._cap("volume_imbalances", 5):]]
 
-            opening_gaps[tf] = [_gap_dict(g) for g in detect_opening_gaps(candles, "day", self.tz)[-3:]]
+            opening_gaps[tf] = [_gap_dict(g) for g in detect_opening_gaps(candles, "day", self.tz)[-self._cap("opening_gaps", 3):]]
 
             sweeps = detect_liquidity_sweeps(candles)
-            recent_sweeps[tf] = [_sweep_dict(s) for s in sweeps[-10:]]
+            recent_sweeps[tf] = [_sweep_dict(s) for s in sweeps[-self._cap("recent_sweeps", 10):]]
 
             disp = detect_displacement(candles)
-            displacements[tf] = [_disp_dict(d) for d in disp[-10:]]
+            displacements[tf] = [_disp_dict(d) for d in disp[-self._cap("displacements", 10):]]
 
             idm = detect_inducement(candles)
-            recent_inducements[tf] = [_idm_dict(d) for d in idm[-10:]]
+            recent_inducements[tf] = [_idm_dict(d) for d in idm[-self._cap("recent_inducements", 10):]]
 
             po3 = detect_power_of_three(candles, period="day", tz=self.tz)
-            po3_phase[tf] = [_po3_dict(p) for p in po3[-3:]]
+            po3_phase[tf] = [_po3_dict(p) for p in po3[-self._cap("po3_phase", 3):]]
 
         # Liquidity pools + DOL (pass pre-computed session_levels to avoid a second scan).
         all_pools = self._build_pools(candles_by_tf, current_price, session_levels)
@@ -287,6 +338,7 @@ class SnapshotBuilder:
             htf_bias=htf_bias,
             htf_bias_source=htf_bias_source,
             recent_swings=recent_swings,
+            market_structure=market_structure,
             premium_discount=premium_discount,
             fvgs=fvgs,
             ifvgs=ifvgs,
@@ -300,7 +352,18 @@ class SnapshotBuilder:
             po3_phase=po3_phase,
             all_pools=all_pools,
             nearest_dol=nearest_dol,
+            pools_to_llm=self.config.pools_to_llm,
         )
+
+    # -- config helpers -------------------------------------------------------
+
+    def _cap(self, field_name: str, default: int) -> int:
+        """Resolve a recency cap from config, falling back to ``default``.
+
+        Centralizes the ``[-N:]`` slice size so every detector reads the same
+        source. A field absent from config falls back to today's literal.
+        """
+        return self._recency_caps.get(field_name, default)
 
     # -- HTF bias -------------------------------------------------------------
 
@@ -314,7 +377,7 @@ class SnapshotBuilder:
         "bearish"/None and source is {timeframe, type, index, timestamp} or
         None. bias and source are always set together (or both None).
         """
-        for tf in ("4h", "1h"):
+        for tf in self.config.htf_tf_order:
             candles = candles_by_tf.get(tf, [])
             if not candles:
                 continue
@@ -413,7 +476,7 @@ class SnapshotBuilder:
         for level, ptype, tf, ts in unique:
             dist = abs(level - current_price)
             # confluence: count other pools within 0.1% of this level.
-            band = abs(level) * 0.001
+            band = abs(level) * self.config.confluence_band_pct
             conf = sum(
                 1 for (l2, _t2, _tf2, _ts2) in unique
                 if l2 is not level and abs(l2 - level) <= band
@@ -455,9 +518,10 @@ class SnapshotBuilder:
 def _compact_dict(snap: MarketSnapshot) -> dict:
     """Serialize a snapshot to a compact dict for the LLM.
 
-    Excludes raw candle lists. Keeps counts, top-5 pools by distance, latest
-    swing per TF, and at most 5 most-recent active entries per detector per TF.
-    Only LLM-relevant fields: level/zone, type, timestamp, mitigated flag.
+    Excludes raw candle lists. Keeps counts, top-N pools by distance (N from
+    ``snap.pools_to_llm``, default 5 == today's literal), latest swing per TF,
+    and at most 5 most-recent active entries per detector per TF. Only
+    LLM-relevant fields: level/zone, type, timestamp, mitigated flag.
 
     Includes ALL detector summaries — opening_gaps is present so the LLM sees
     the full schema (no detector is silently starved).
@@ -465,7 +529,7 @@ def _compact_dict(snap: MarketSnapshot) -> dict:
     def _ts(v):
         return str(v) if v is not None else None
 
-    pools = [p.to_dict() for p in snap.all_pools[:5]]
+    pools = [p.to_dict() for p in snap.all_pools[:snap.pools_to_llm]]
     dol = snap.nearest_dol.to_dict() if snap.nearest_dol else None
 
     return {
@@ -483,6 +547,7 @@ def _compact_dict(snap: MarketSnapshot) -> dict:
         "recent_swings": {
             tf: (lst[-1] if lst else None) for tf, lst in snap.recent_swings.items()
         },
+        "market_structure": snap.market_structure,
         "premium_discount": {
             tf: (lst[-1] if lst else None) for tf, lst in snap.premium_discount.items()
         },
@@ -506,6 +571,14 @@ def _compact_dict(snap: MarketSnapshot) -> dict:
 
 def _swing_dict(s: dict) -> dict:
     return {"type": s["type"], "price": round(s["price"], 2), "label": s.get("label")}
+
+
+def _structure_dict(b: dict) -> dict:
+    return {
+        "type": b["type"],  # bos_bullish|bos_bearish|choch_bullish|choch_bearish
+        "break_price": round(b["break_price"], 2),
+        "timestamp": str(b["timestamp"]),
+    }
 
 
 def _pd_dict(p: dict) -> dict:
