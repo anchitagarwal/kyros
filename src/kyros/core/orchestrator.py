@@ -152,7 +152,12 @@ class Orchestrator:
         self._ws.mkdir(parents=True, exist_ok=True)
         self.loader = KyrosAgentLoader(workspace_root)
         self.router = ModelRouter()
-        self.toolkit = ExecutorToolkit(self.root)
+        # Fence agent writes to the sanctioned surface only: workspace/ (all
+        # phase code + artifacts) and tests/ (the suite the Executor authors).
+        # Reads and pytest stay repo-wide. This is a hard guard so an Executor
+        # cannot rewrite infrastructure (config/prompts.yaml, main.py, src/,
+        # .kyros_state.json) the way a rogue model did during Phase 2B.
+        self.toolkit = ExecutorToolkit(self.root, write_roots=["workspace", "tests"])
 
     # ── Public API ─────────────────────────────────────────────────────────────
 

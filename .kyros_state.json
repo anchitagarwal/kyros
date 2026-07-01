@@ -1,10 +1,10 @@
 {
   "project": "kyros",
-  "current_phase": "phase_3b",
-  "active_branch": "main",
+  "current_phase": "phase_2b",
+  "active_branch": "phase-2b-fib-liquidity-cycle",
   "locked_files": [],
   "last_test_status": "pass",
-  "last_review_status": "APPROVE",
+  "last_review_status": "pending",
   "evaluator_round": 0,
   "max_evaluator_rounds": 3,
   "infrastructure": {
@@ -14,8 +14,8 @@
       "temperature": 0.2
     },
     "executor": {
-      "provider": "zai",
-      "model": "glm-5.2",
+      "provider": "openai",
+      "model": "gpt-5.2",
       "temperature": 0.0
     },
     "evaluator": {

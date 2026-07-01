@@ -1,158 +1,66 @@
-# Phase 3B Contract — Offline Tuning & Walk-Forward Harness
+# Phase 2B Executor Contract (update)
 
-## State at handoff
+## Resume check (current repo state)
+- `.kyros_state.json` exists at repo root (NOT under `workspace/`). Current phase: `phase_2b`. `evaluator_round=2`, `max_evaluator_rounds=3`.
+- Test status: `uv run pytest` currently **fails** with 1 failure:
+  - `tests/test_agent_loader.py::test_evaluator_prompt_includes_current_round_context` expects evaluator prompt to include `"round 1 of 3"`.
+- Phase 2B continuation items (weighted DOL scoring) are **not implemented** in `workspace/trading/`:
+  - No `_score_pool`, `_rank_dols`, `ranked_dols`, `clarity_score`, `score_breakdown`.
+  - `_dol_target` still uses `_nearest_internal/_nearest_external` first-match logic.
+  - `_build_pools` dedup is by `(level,type,role)` not `(level,type)`.
+  - `reasoning_agent.py` prompt still uses the forbidden `1, 2, 1.5, 3` ordering.
 
-Round 1 (BLOCK) found the entire Phase 3B deliverable missing and the P0
-prerequisite (SnapshotBuilder threading) incomplete. Round 2 implemented the
-full phase. This round (round 3) verifies the implementation is complete and
-correct, strengthens two weak tests, and fixes a report section-numbering
-inconsistency. No behavioral logic changed.
+## Frozen boundaries (must remain true)
+- `workspace/detectors/`: ONLY allowed changes are adding `fibonacci.py` (already present) and its single export line in `__init__.py` (already present). No other detector edits.
+- `workspace/trading/`: only additive changes per Phase 2B continuation spec. `_nearest_dol` must remain byte-identical.
+- `workspace/backtesting/` and `workspace/tuning/`: off-limits.
 
-**Current state: 516 tests pass (Phase 1/2/3A + 99 phase3b), all offline.**
+## Planned changes (mapped to review findings)
 
-## Prerequisite gate (P0) — PASSED
+### A) Fix failing test: evaluator round context (tests/test_agent_loader.py)
+- **Why**: suite currently failing; must be green before Phase 2B work can be validated.
+- **Change**: update `config/prompts.yaml` evaluator prompt to include a literal `ROUND CONTEXT` section containing `"round 1 of 3"` (lowercased match) and ensure it does **not** include `"FINAL allowed round"` by default.
+- **Note**: This is outside `workspace/`, but required to restore baseline green tests.
 
-`TradingConfig` is threaded through `SnapshotBuilder`, `TriggerEngine`,
-`CooldownState`, and `validate_rr` with defaults == today's literals. The
-**unedited** Phase 1/2/3A suite stays green (417 pre-existing tests + 99
-phase3b = 516 total). Verified: `git diff --stat HEAD -- workspace/trading/`
-is empty (config threading is committed; no working-tree trading changes).
+### B) Implement weighted DOL scoring continuation (review HIGH #1-#3)
+Files: `workspace/trading/config.py`, `workspace/trading/snapshot.py`, `workspace/trading/reasoning_agent.py`, plus new tests under `tests/phase2/`.
 
-### O0 resolution (conviction default) — confirmed byte-preserving
-Audited `workspace/trade_traces.jsonl` (179 traces): all directional (taken)
-trades have conviction ∈ {62, 68, 72} — every one ≥ 40. The LLM prompt enforces
-"conviction < 40 → no_trade"; the Python layer never checked conviction before.
-A Python conviction gate with default 40 is a no-op for every current input →
-byte-identical. Default stays 40. (A no_trade's conviction is 0, but
-`validate_rr` short-circuits on `bias == "no_trade"` before the conviction
-gate, so placeholder geometry is never re-examined.)
+1) `workspace/trading/config.py`
+- Add defaults + accessors:
+  - `_DEFAULT_DOL_WEIGHTS`, `_DEFAULT_TF_WEIGHTS`, `_DEFAULT_ROLE_WEIGHTS` (tuple-of-tuples)
+  - `dol_weights_dict()`, `tf_weights_dict()`, `role_weights_dict()`
+  - `ranked_dols_to_llm: int = 5`
+- Extend `config_hash()` canonical dict with these new knobs.
 
-## What exists (implemented)
+2) `workspace/trading/snapshot.py`
+- Extend `LiquidityPool` (defaulted): `clarity_score: float = 0.0`, `score_breakdown: dict = field(default_factory=dict)`.
+- Extend `LiquidityPool.to_dict()` to emit `clarity_score` and `score_breakdown`.
+- Extend `MarketSnapshot` (defaulted): `ranked_dols: list[LiquidityPool] = field(default_factory=list)`.
+- Add `_score_pool` (pure) and `_rank_dols` (direction-filter then score then sort desc; stable distance tiebreak).
+- Rewrite `_dol_target`:
+  - If `cycle is None` or `dol_use_cycle` False → call `_nearest_dol` over **ERL-only** pools (`scope=="external"`) (repair #1) while keeping `_nearest_dol` unchanged.
+  - Else → return `_rank_dols(...)[0]` (or None).
+  - Delete `_nearest_internal` and `_nearest_external`.
+- Add `ranked_dols` population in `build()` and ensure `dol_target == ranked_dols[0]` when cycle active.
+- Update `_compact_dict` to include `ranked_dols` (top-N via config) and serialize `dol_target` accordingly.
 
-### P0 — config threading (workspace/trading/, committed)
-| File | Change | Fields threaded |
-|------|--------|-----------------|
-| `config.py` | NEW | TradingConfig dataclass + config_hash() + short_hash() |
-| `alert.py` | config threading | `validate_rr(alert, config=...)`: rr_min, conviction_min |
-| `cooldown.py` | config threading | `CooldownState(config=...)`: no_trade_cooldown_minutes |
-| `trigger.py` | config threading | `TriggerEngine(cd, config=...)`: soft_trigger_order, soft_trigger_tf_map |
-| `snapshot.py` | config threading | `SnapshotBuilder(config=...)`: confluence_band_pct, recency_caps, pools_to_llm, htf_tf_order, killzone_windows |
+3) `workspace/trading/snapshot.py` dedup repair (review MEDIUM #6 / repair #5)
+- Change dedup to merge on `(level,type)` keeping richest role by priority and recompute confluence on merged set.
 
-`candle_source.py` has a parquet-read + `__len__` change, but that is Phase 3A
-infrastructure (committed in `520d026`), NOT a Phase 3B behavioral change.
+4) `workspace/trading/reasoning_agent.py` prompt repair (review HIGH #5 / repair #7)
+- Reorder steps so cycle read precedes direction selection; remove fractional numbering.
+- Update DOL step to use `ranked_dols` and default to top `clarity_score`.
+- Keep OUTPUT JSON schema unchanged.
 
-### Phase 3B tuning layer (workspace/tuning/, all new)
-| Module | Blueprint component | Reuses |
-|--------|---------------------|--------|
-| `params.py` | PostLLMParams + PreLLMGrid + param_grid | TradingConfig |
-| `rescore.py` | rescore_trace / rescore_traces | validate_rr's R:R formula (shared `compute_rr`) |
-| `objective.py` | evaluate() | PerformanceReport._overall_metrics (expectancy) |
-| `search.py` | best_params() | objective.evaluate |
-| `walkforward.py` | make_folds / run_walkforward | objective + search |
-| `report.py` | WalkForwardReport.generate | metrics in FoldResult (no recompute) |
-| `scripts/run_tuning.py` | CLI; --record drives Tier-2 | TriggerCalibrator (cost), BacktestEngine (record/resume), KyrosAgentLoader |
+### C) Add/extend tests for scoring (review HIGH #3)
+- Add tests under `tests/phase2/`:
+  - `_score_pool` monotonicity for key factors.
+  - `_rank_dols` wrong-side exclusion.
+  - Core behavior: farther high-TF external pool beats nearer low-TF pool (proximity does not dominate).
+  - Determinism: same inputs → identical ranked list + breakdown.
+  - Fallback: cycle None / dol_use_cycle False equals `_nearest_dol` over ERL-only set.
 
-### Tests (tests/phase3b/, all offline) — 99 tests
-`test_config.py`, `test_rescore.py`, `test_objective.py`, `test_search.py`,
-`test_walkforward.py`, `test_report.py`, `test_run_tuning.py`.
-
-## What changed this round (round 3)
-
-### 1. Fixed report section-numbering inconsistency (workspace/tuning/report.py)
-**Before:** sections 1–4 and 6 were numbered (`## 1.`, `## 2.`, …, `## 6.`),
-but section 5 was unnumbered (`## Disclaimer`). This made the six-section
-structure ambiguous and forced a convoluted test assertion.
-**After:** section 5 is now `## 5. Disclaimers` (the body + leakage note are
-unchanged). All six sections are consistently numbered, matching the
-blueprint's "Mandatory sections 1–6." The `_DISCLAIMER` constant was split into
-`_DISCLAIMER_BODY` (the text, header now emitted by `generate`) so the header
-is owned by the section renderer, not the constant.
-
-### 2. Strengthened test_tier2_cost_math (tests/phase3b/test_run_tuning.py)
-**Before:** the test did NOT call `estimate_recording_cost` — it just asserted
-`3 * 100 * 0.003 == 0.9` inline (a tautology testing nothing).
-**After:** the test mocks `TriggerCalibrator` (to return a known fire count)
-and `ReplayCandleSource`, then calls the REAL `estimate_recording_cost` and
-asserts it returns `0.9` for 3 configs × 100 fires × $0.003. Added
-`test_tier2_cost_math_scales_with_fires` to verify cost scales linearly with
-per-config fire counts.
-
-### 3. Strengthened test_default_path_makes_zero_llm_calls (tests/phase3b/test_run_tuning.py)
-**Before:** the test's docstring claimed it patched LLM call sites to raise,
-but it did no such patching — it just ran `run_default` and checked the report
-contained "Kyros Walk-Forward" (proving nothing about LLM calls).
-**After:** the test snapshots `sys.modules` before/after `run_default` and
-asserts NO LLM/Tier-2 module (model_router, agent_loader, reasoning_agent,
-backtesting.engine, backtesting.calibrator, openai, anthropic) is newly
-imported. An empty import set proves the default path is purely offline
-arithmetic — zero LLM calls.
-
-### 4. Updated test assertions for the renamed section-5 header
-`test_report.py::test_report_has_all_six_sections`, `test_report.py::
-test_disclaimer_present`, and `test_run_tuning.py::
-test_default_path_produces_report_no_api_key` now assert `## 5. Disclaimers`
-(the new header) instead of `## Disclaimer`.
-
-## Key design decisions (pinned, unchanged from round 2)
-
-1. **"Allow all" sentinel**: `ALL = frozenset({"*"})` = no filter; empty
-   frozenset = reject everything (testable). `default_post_params()` uses `ALL`
-   on both axes (baseline = no filtering = today's behavior).
-2. **R:R recompute in rescore**: shared `compute_rr` mirrors `validate_rr`
-   exactly (pinned by `test_rr_recompute_matches_validate_rr`). Degenerate
-   (risk==0) taken trade → no_trade (matches validate_rr's degenerate_stop).
-3. **Objective = PerformanceReport.expectancy**: single source of truth is
-   `PerformanceReport._overall_metrics(traces)["expectancy"]` = mean(actual_rr)
-   with no_trade/no_fill/expired = 0. REUSED, never recomputed independently.
-4. **MIN_TRADES guard**: `evaluate` returns `(-inf, metrics)` when
-   `taken_trades < min_trades`; metrics always populated; finite at exactly
-   min_trades.
-5. **Walk-forward folds**: rolling, half-open `[start, start+train_days)` /
-   `[start+train_days, start+train_days+test_days)`. Per-fold disjointness
-   ASSERTED (`_assert_disjoint`, release blocker). Folds with empty train or
-   test dropped. Timestamps parsed once to aware datetimes (naive → ET).
-6. **Tie-break in search**: first-in-grid-order wins (deterministic).
-7. **All-below-min_trades fallback**: returns baseline params with their score.
-8. **Aggregation**: reports BOTH mean-of-folds AND trade-weighted (pooled).
-9. **Overfitting warning**: fires when (mean IS − mean OOS) > 0.5R OR tuned
-   OOS ≤ baseline OOS (latter → "Tuning added nothing; use baseline.").
-10. **Tier-2 recording**: cost = `n_configs × total_fires × $0.003` (one
-    full-span backtest per config; folds do NOT multiply cost). Per-config
-    `runs/{config_hash}/` dirs. Cost gate mirrors Phase 3A spend gate.
-    Idempotent resume via BacktestEngine.
-
-## Review-finding resolution map (round 1 → round 2, all resolved)
-| Finding | Severity | Resolution |
-|---------|----------|------------|
-| Phase 3B tuning layer missing | CRITICAL | All 7 modules implemented |
-| No Phase 3B tests | CRITICAL | tests/phase3b/ — 99 tests, green offline |
-| SnapshotBuilder not threaded (P0) | CRITICAL | Threaded for all 5 fields; accessors live |
-| rescore reuse unverifiable | HIGH | rescore.py + test_surviving_trade_outcome_byte_identical |
-| objective + MIN_TRADES unverifiable | HIGH | objective.py + test_below/at_min_trades |
-| walk-forward no-leakage unverifiable | HIGH | walkforward.py + adversarial boundary + disjointness tests |
-| honesty diagnostics absent | HIGH | report.py — all 6 sections + both overfit conditions |
-| Tier-2 recording safety unverifiable | MEDIUM | run_tuning.py cost gate + per-config dirs + idempotent resume |
-| dead accessors / unused import | LOW | accessors wired; import removed |
-
-## Frozen-boundary compliance
-- `workspace/detectors/` — READ-ONLY, untouched
-  (`git diff --name-only HEAD -- workspace/detectors/` empty).
-- `workspace/trading/` — only config threading (committed; no working-tree
-  changes). The `candle_source.py` parquet-read + `__len__` and the
-  `snapshot.py` `market_structure` field are Phase 3A infrastructure carryover
-  (committed in `520d026`), NOT Phase 3B behavioral changes.
-- `workspace/backtesting/` — untouched (`git diff --stat HEAD` empty).
-- No broker, no IBKR, no live data, no orders. Tier 1 = zero LLM calls
-  (verified by `test_default_path_makes_zero_llm_calls` — no LLM modules
-  imported during the default path — + offline real-traces integration test
-  with no API key).
-
-## Verification commands run this round
-```
-uv run pytest -q                          → 516 passed
-uv run pytest tests/phase3b/ -q           → 99 passed
-git diff --stat HEAD -- workspace/trading/   → (empty; committed)
-git diff --name-only HEAD -- workspace/detectors/ → (empty; untouched)
-git diff --stat HEAD -- workspace/backtesting/ → (empty; untouched)
-# Default path over real traces, no API key → report with 6 sections, 2 folds
-```
+## Verification steps
+- Run `uv run pytest` after each file change.
+- Confirm `_nearest_dol` remains byte-identical (manual diff / grep).
+- Ensure only golden updates are serializer additions (scope/role/clarity_score/ranked_dols) where applicable.
