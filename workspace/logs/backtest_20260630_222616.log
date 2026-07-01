@@ -1,0 +1,85 @@
+2026-06-30 22:26:16,564 INFO    kyros.backtest | Logging to /Users/anchit/src/kyros/workspace/logs/backtest_20260630_222616.log
+2026-06-30 22:26:16,564 INFO    kyros.backtest | Kyros Phase 3A backtest runner
+2026-06-30 22:26:16,564 INFO    kyros.backtest | repo root  : /Users/anchit/src/kyros
+2026-06-30 22:26:16,564 INFO    kyros.backtest | date range : 2026-06-01 → 2026-06-04 (inclusive)
+2026-06-30 22:26:16,564 INFO    kyros.backtest | data backend: csv
+2026-06-30 22:26:16,564 INFO    kyros.backtest | csv path   : workspace/data/nq_1min_data.csv
+2026-06-30 22:26:16,564 INFO    kyros.backtest | Loading NQ 1m data...
+2026-06-30 22:26:16,564 INFO    kyros.backtest | Data ready in 0.0s → workspace/data/NQ_1m_2026-06-01_2026-06-04_csv.parquet
+2026-06-30 22:26:16,826 WARNING py.warnings | /Users/anchit/src/kyros/scripts/run_backtest.py:353: UserWarning: ReplayCandleSource: 4 non-contiguous 1m gap(s) detected in 5520 bars. Higher-TF resampling will produce sparse bars across these gaps. First gap(s): 2026-06-01 16:59:00-04:00 → 2026-06-01 18:00:00-04:00 (0 days 01:01:00); 2026-06-02 16:59:00-04:00 → 2026-06-02 18:00:00-04:00 (0 days 01:01:00); 2026-06-03 16:59:00-04:00 → 2026-06-03 18:00:00-04:00 (0 days 01:01:00); ...
+  cal = run_calibration(ReplayCandleSource(str(data_path), validate_gaps=True), progress)
+
+2026-06-30 22:26:16,937 INFO    kyros.backtest | ── Stage 1: trigger calibration (no LLM) ──
+2026-06-30 22:29:01,511 INFO    kyros.backtest | Calibration finished in 164.6s → workspace/calibration_report.json
+2026-06-30 22:29:01,511 INFO    kyros.backtest |   period               : 2026-05-31 20:00:00-04:00 → 2026-06-04 19:58:00-04:00
+2026-06-30 22:29:01,511 INFO    kyros.backtest |   1m candles evaluated : 5,519
+2026-06-30 22:29:01,511 INFO    kyros.backtest |   trigger fires        : 11
+2026-06-30 22:29:01,511 INFO    kyros.backtest |   est. LLM cost        : ~$0.03
+2026-06-30 22:29:01,511 INFO    kyros.backtest |   gate blocks (first failing gate per candle):
+2026-06-30 22:29:01,511 INFO    kyros.backtest |     no_killzone           4,079  (73.9%)
+2026-06-30 22:29:01,511 INFO    kyros.backtest |     no_htf_bias             210  ( 3.8%)
+2026-06-30 22:29:01,511 INFO    kyros.backtest |     no_dol                    1  ( 0.0%)
+2026-06-30 22:29:01,511 INFO    kyros.backtest |     cooldown_active       1,218  (22.1%)
+2026-06-30 22:29:01,511 INFO    kyros.backtest |     no_soft_trigger           0  ( 0.0%)
+2026-06-30 22:29:01,511 INFO    kyros.backtest |   soft triggers fired:
+2026-06-30 22:29:01,511 INFO    kyros.backtest |     fvg                      11
+2026-06-30 22:29:01,511 INFO    kyros.backtest |     ifvg                      0
+2026-06-30 22:29:01,511 INFO    kyros.backtest |     sweep                     0
+2026-06-30 22:29:01,511 INFO    kyros.backtest |     displacement              0
+2026-06-30 22:29:01,511 INFO    kyros.backtest |   fires by killzone:
+2026-06-30 22:29:01,511 INFO    kyros.backtest |     london_kz                 3
+2026-06-30 22:29:01,511 INFO    kyros.backtest |     ny_am_kz                  4
+2026-06-30 22:29:01,511 INFO    kyros.backtest |     ny_pm_kz                  4
+2026-06-30 22:29:01,512 INFO    kyros.backtest | reasoning model: anthropic/claude-opus-4-8 (temp=1.0)
+2026-06-30 22:29:01,630 INFO    kyros.backtest | ── Stage 2: backtest engine (LLM in loop) ──
+2026-06-30 22:29:22,486 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-30 22:29:40,774 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-30 22:29:49,086 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-30 22:30:15,111 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-30 22:30:37,536 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-30 22:30:45,568 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-30 22:30:54,268 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-30 22:31:09,895 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-30 22:31:41,760 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-30 22:31:49,320 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-30 22:32:13,584 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-30 22:32:22,347 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-30 22:32:40,704 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-30 22:32:50,346 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-30 22:32:59,193 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-30 22:33:07,754 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-30 22:33:16,511 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-30 22:33:23,687 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-30 22:33:32,086 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-30 22:33:41,516 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-30 22:33:48,512 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-30 22:34:18,796 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-30 22:34:42,864 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-30 22:34:59,374 DEBUG   asyncio | Using selector: KqueueSelector
+2026-06-30 22:35:10,229 INFO    kyros.backtest | Backtest finished in 368.6s (6.1 min). 24 total traces → /Users/anchit/src/kyros/workspace/trade_traces.jsonl
+2026-06-30 22:35:10,231 INFO    kyros.backtest | ── Stage 3: performance report ──
+2026-06-30 22:35:10,234 INFO    kyros.backtest | Report written → /Users/anchit/src/kyros/workspace/backtest_report.md
+2026-06-30 22:35:10,234 INFO    kyros.backtest |   **System prompt version:** `6874a38f`
+2026-06-30 22:35:10,234 INFO    kyros.backtest |   ## Overall Metrics
+2026-06-30 22:35:10,234 INFO    kyros.backtest |   - Total traces: 24
+2026-06-30 22:35:10,234 INFO    kyros.backtest |   - No-trade rate: 54.2% (13)
+2026-06-30 22:35:10,234 INFO    kyros.backtest |   - Actionable alerts: 11
+2026-06-30 22:35:10,234 INFO    kyros.backtest |   - Fill rate (filled / actionable): 81.8% (9/11)
+2026-06-30 22:35:10,234 INFO    kyros.backtest |   - Win rate (of filled): 11.1% (1)
+2026-06-30 22:35:10,234 INFO    kyros.backtest |   - Loss rate (of filled): 66.7% (6)
+2026-06-30 22:35:10,234 INFO    kyros.backtest |   - Expired rate (of filled): 22.2% (2)
+2026-06-30 22:35:10,234 INFO    kyros.backtest |   - Cancelled (target/stop hit before entry): 2
+2026-06-30 22:35:10,234 INFO    kyros.backtest |   - Avg winning R: 2.16
+2026-06-30 22:35:10,234 INFO    kyros.backtest |   - Avg losing R: -1.03
+2026-06-30 22:35:10,234 INFO    kyros.backtest |   - Profit factor: 0.35
+2026-06-30 22:35:10,234 INFO    kyros.backtest |   - Max drawdown (R): 4.09
+2026-06-30 22:35:10,234 INFO    kyros.backtest |   - Expectancy per trade (R): -0.1677
+2026-06-30 22:35:10,234 INFO    kyros.backtest |   ## By Model Type
+2026-06-30 22:35:10,234 INFO    kyros.backtest |   ## By Killzone
+2026-06-30 22:35:10,234 INFO    kyros.backtest |   ## By Month
+2026-06-30 22:35:10,234 INFO    kyros.backtest |   ## Golden Dataset Match
+2026-06-30 22:35:10,234 INFO    kyros.backtest |   - Total directional golden entries (within backtest window): 3
+2026-06-30 22:35:10,234 INFO    kyros.backtest |   - Matched (within ±15 min, same direction): 0
+2026-06-30 22:35:10,234 INFO    kyros.backtest |   - Match rate: 0.0%
+2026-06-30 22:35:10,235 INFO    kyros.backtest | Done.
+2026-06-30 22:35:13,808 DEBUG   asyncio | Using selector: KqueueSelector

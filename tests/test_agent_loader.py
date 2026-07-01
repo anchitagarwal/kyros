@@ -42,18 +42,6 @@ def test_get_agent_config_evaluator():
     assert config["model_engine"]["provider"]  # non-empty string — don't hardcode
 
 
-def test_evaluator_prompt_includes_current_round_context():
-    loader = KyrosAgentLoader(workspace_root=str(REPO_ROOT))
-
-    config = loader.get_agent_config("evaluator")
-
-    assert "ROUND CONTEXT" in config["final_system_prompt"]
-    assert "round 1 of 3" in config["final_system_prompt"].lower()
-    # Not yet at the cap, so the final-round escalation instruction
-    # should not be present
-    assert "FINAL allowed round" not in config["final_system_prompt"]
-
-
 @pytest.fixture
 def isolated_workspace(tmp_path):
     """Minimal workspace with its own state + prompt files, so round-tracking
@@ -67,6 +55,18 @@ def isolated_workspace(tmp_path):
     (tmp_path / ".kyros_state.json").write_text(json.dumps(state))
 
     return tmp_path
+
+
+def test_evaluator_prompt_includes_current_round_context(isolated_workspace):
+    loader = KyrosAgentLoader(workspace_root=str(isolated_workspace))
+
+    config = loader.get_agent_config("evaluator")
+
+    assert "ROUND CONTEXT" in config["final_system_prompt"]
+    assert "round 1 of 3" in config["final_system_prompt"].lower()
+    # Not yet at the cap, so the final-round escalation instruction
+    # should not be present
+    assert "FINAL allowed round" not in config["final_system_prompt"]
 
 
 def test_increment_evaluator_round(isolated_workspace):

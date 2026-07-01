@@ -1,384 +1,357 @@
-Before producing the blueprint, I need to flag the gate-zero dependency and confirm my reading of the frozen-layer contract. The rest is the per-component blueprint.
+I'll start by checking the project state before producing the blueprint.
+
+Before writing the blueprint, I must verify `.kyros_state.json` to confirm phase status and frozen boundaries. Assuming that check confirms Phases 1/2/3A/3B complete and the carve-outs described, here is the architectural blueprint. **I am producing design only — no implementation code.**
 
 ---
 
-## PREREQUISITE GATE (must pass before any tuning component is built)
+# Phase 2B Blueprint — Fibonacci Levels & Liquidity-Cycle DOL
 
-**Hard prerequisite P0 — config threading must be byte-identical.**
-The only permitted edit to `workspace/trading/` is threading `config: TradingConfig = TradingConfig()` through `SnapshotBuilder`, `TriggerEngine`, `CooldownState`, and `validate_rr`, replacing hardcoded literals with config reads whose defaults equal today's literals. The acceptance test for P0 is: **the entire pre-existing Phase 1/2/3A suite passes with zero edits to any existing test.** If any Phase 2 test changes behavior or requires editing, that is a **blueprint failure** — the Executor must STOP and report it, not design around it. No tuning component may be built until P0 is green.
+## Hard Contract (state-of-freeze for the Executor)
 
-**Open question O0 (must be resolved by reading the code before implementation):**
-The brief says `conviction_min` "the prompt's 40 floor, now also enforceable in Python." I need the Executor to confirm whether conviction is currently enforced *only* in the LLM prompt (i.e. the Python trading layer never rejects on conviction today). If so, adding a Python conviction gate with default `40` is **only** byte-identical if every recorded alert today already has conviction ≥ 40 (because the prompt enforced it). The Executor MUST verify this against existing fixtures. If any historical alert has conviction < 40 and currently passes, then default-40 is NOT behavior-preserving and the default must be set to the value that reproduces current behavior (likely `0` / disabled-in-Python), with 40 available only as a tunable. **Resolve before coding config.py.**
+Before any component, the Executor MUST treat these as binding:
+
+- `workspace/detectors/` — **ADD `fibonacci.py` + one `__all__`/import line in `__init__.py`. Nothing else.** Any edit to `premium_discount.py`, `swings.py`, `fvg.py`, `order_blocks.py`, `structure.py`, `displacement.py`, `liquidity.py` is a CRITICAL scope violation.
+- `workspace/trading/` — additive-only, per the enumerated list below. `_nearest_dol` stays **byte-identical**. Existing field defaults stay **byte-identical**.
+- The ONLY intentional non-additive serializer surface: `LiquidityPool.to_dict` gains `scope`, `role`, `clarity_score`, `score_breakdown`. Exactly one pool golden test and the snapshot golden test that assert pool-dict / compact-dict shape must be updated to match — flagged per component.
+- `workspace/backtesting/`, `workspace/tuning/` — OFF-LIMITS. Do not open them.
+- `workspace/knowledge_base/` is untrusted. It corroborates the ERL↔IRL loop and the "Low Hanging Fruit" framing; it is NOT authority. No config default, weight, or rule is justified by KB text alone — each maps to an existing deterministic signal.
+- Offline only. No broker, no live feed, no API key in tests.
 
 ---
 
-# Component: TradingConfig
+# Component: detect_fibonacci (detectors/fibonacci.py)
+
 ## Purpose
-Single dataclass holding every currently-hardcoded trading knob so Tier-2 can record alternate pre-LLM configurations without editing the frozen trading layer. Provides a stable hash for per-config output paths.
-
-## Interface
-`workspace/trading/config.py`
-```
-@dataclass(frozen=True)
-class TradingConfig:
-    rr_min: float = 1.0
-    conviction_min: int = <VALUE PER O0>          # see prerequisite O0
-    no_trade_cooldown_minutes: int = 5
-    confluence_band_pct: float = 0.001
-    recency_caps: Mapping[str, int] = (defaults below)
-        # sweeps/displacements/inducements = 10
-        # swings/fvg/ifvg/ob/breaker/volume_imbalance = 5
-        # opening_gaps/po3 = 3
-    pools_to_llm: int = 5
-    htf_tf_order: tuple[str, ...] = ("4h", "1h")
-    killzone_windows: Mapping[str, tuple[str, str]] = (current literals)
-    soft_trigger_order: tuple[str, ...] = (current literal)
-    soft_trigger_tf_map: Mapping[str, str] = (current literals)
-
-    def config_hash(self) -> str: ...   # sha256 over a canonical, sorted field tuple
-```
-Mutable-default fields (Mappings/tuples) must be frozen/immutable types so the dataclass stays hashable and `config_hash()` is stable. `config_hash()` MUST canonicalize: sort mapping keys, normalize numeric formatting, then sha256 — so two logically-equal configs hash identically and float reordering cannot fork a run directory.
-
-## Correctness Criteria
-- `TradingConfig()` field-by-field equals every current literal in the trading layer (audit each call site).
-- Behavior-preserving: with no config passed, SnapshotBuilder/TriggerEngine/CooldownState/validate_rr produce byte-identical outputs to pre-change code (verified by the unedited Phase 2 suite).
-- `config_hash()` is deterministic across processes and Python hash-seed randomization (must NOT use builtin `hash()`).
-- Two configs differing in any tunable field produce different hashes; two equal configs produce identical hashes.
-
-## Test Strategy
-- Unit: default values match a hardcoded expected snapshot of today's literals.
-- Unit: `config_hash()` stable across two constructions, differs on any field change, insensitive to mapping insertion order.
-- Integration (the real gate): full Phase 1/2/3A suite green, unedited.
-- Differential: run SnapshotBuilder/TriggerEngine on a fixture with `config=None` vs `config=TradingConfig()` → byte-identical outputs.
-
-## Dependencies
-REUSES nothing; CONSUMED BY every Tier-2 component and the recording loop. No new logic — only relocates literals.
-
-## Risks & Open Questions
-- O0 (conviction default) above is the dominant risk to byte-identity.
-- Risk: a literal hides in a default argument or constant elsewhere in the call chain and gets missed → behavior drifts only on non-default configs. Mitigation: differential test plus a grep audit listed in the Executor checklist.
-
----
-
-# Component: PostLLMParams + grids
-## Purpose
-Typed search space. PostLLMParams = the Tier-1 (free) re-scoring knobs. PreLLMGrid = the Tier-2 (costly) recording variants.
-
-## Interface
-`workspace/tuning/params.py`
-```
-@dataclass(frozen=True)
-class PostLLMParams:
-    conviction_min: int
-    rr_min: float
-    allowed_models: frozenset[str]
-    allowed_killzones: frozenset[str]
-
-def param_grid(
-    conviction_mins: Sequence[int],
-    rr_mins: Sequence[float],
-    model_sets: Sequence[frozenset[str]],
-    killzone_sets: Sequence[frozenset[str]],
-) -> Iterator[PostLLMParams]: ...   # cartesian product
-
-def default_post_params() -> PostLLMParams: ...   # mirrors TradingConfig() defaults
-
-def PreLLMGrid(configs: Sequence[TradingConfig] | None = None) -> list[TradingConfig]:
-    # default -> [TradingConfig()]  (i.e. Tier-2 sweep off by default → zero cost)
-```
-
-## Correctness Criteria
-- `param_grid` yields the full cartesian product, deterministic order.
-- `default_post_params()` equals the post-LLM projection of `TradingConfig()` — so baseline tuning == baseline config.
-- `PreLLMGrid()` with no args yields exactly `[TradingConfig()]` (default path is free).
-- `allowed_models` / `allowed_killzones` semantics: empty set = "allow nothing" or a sentinel "allow all"? **Decide and document**: recommend `None`-or-sentinel for "allow all" to avoid empty-set ambiguity; an empty frozenset must mean "reject everything" and be testable as such.
-
-## Test Strategy
-- Unit: product size = ∏ axis lengths; order deterministic across runs.
-- Unit: default params equal config-derived baseline.
-- Unit: PreLLMGrid default is single-element identity-default config.
-
-## Dependencies
-REUSES TradingConfig.
-
-## Risks & Open Questions
-- "Allow all" sentinel ambiguity (above) — must be nailed in the interface so rescore.py and report.py agree.
-
----
-
-# Component: rescore
-## Purpose
-Apply PostLLMParams to a recorded trace by pure arithmetic: filtered alerts become `no_trade` (R=0); surviving alerts keep their recorded outcome verbatim. No re-simulation, ever.
-
-## Interface
-`workspace/tuning/rescore.py`
-```
-def rescore_trace(trace: dict, p: PostLLMParams) -> dict: ...
-def rescore_traces(traces: Iterable[dict], p: PostLLMParams) -> list[dict]: ...
-```
-`rescore_trace` returns a NEW dict (no mutation of input). When the recorded alert fails ANY of:
-- `alert.conviction < p.conviction_min`
-- recomputed `risk_reward < p.rr_min`
-- `alert.model not in p.allowed_models`
-- `alert.killzone not in p.allowed_killzones`
-…it rewrites the trace to a `no_trade` outcome with `actual_rr = 0` and sets `alert.bias`/outcome fields to the no_trade form used elsewhere. Otherwise the trace is returned unchanged (recorded outcome reused).
-
-risk_reward is **recomputed from the recorded entry/stop/target** (not read from a possibly-stale stored field), using the same R:R formula `validate_rr` uses, so the rr_min filter is internally consistent with the trading layer.
-
-## Correctness Criteria
-- Idempotent: `rescore_trace(rescore_trace(t,p),p) == rescore_trace(t,p)`.
-- A trace already recorded as `no_trade`/`no_fill`/`expired` stays whatever it is — filters only ever *downgrade* a taken trade to no_trade; they never promote.
-- Surviving taken trades have byte-identical outcome/actual_rr to the input.
-- Order preserved (chronological) by `rescore_traces`.
-- **MANDATORY documented limitation (docstring + report):** re-scoring treats alerts as independent and ignores cooldown re-interaction — filtering a trade would in reality free a cooldown slot the LLM was never queried about. Therefore cooldown is a TradingConfig (recording-time, Tier-2) knob, NOT a post-LLM re-scored filter. `PostLLMParams` deliberately has no cooldown field.
-
-## Test Strategy
-- Unit: each filter independently flips a crafted taken trade to no_trade; passing trace unchanged.
-- Unit: rr recompute matches `validate_rr` on the same entry/stop/target.
-- Unit: idempotence; order preservation; no input mutation.
-- Unit: pre-existing no_trade/no_fill traces untouched by any filter.
-- Property: for any params, every output trace's outcome ∈ {original-outcome, no_trade}.
-
-## Dependencies
-REUSES the R:R formula from `validate_rr` (workspace/trading) — import/share, do not duplicate the arithmetic.
-
-## Risks & Open Questions
-- Trace schema field names (`conviction`, `model`, `killzone`, `entry_zone`/`stop`/`target`) must be confirmed against the actual Phase 3A trace_traces.jsonl schema before coding. The Executor must pin these to the real keys, not assumed ones.
-
----
-
-# Component: objective
-## Purpose
-Score a (traces, params) pair by re-scoring then computing expectancy via the existing report engine.
-
-## Interface
-`workspace/tuning/objective.py`
-```
-MIN_TRADES: int  # module constant, overridable by caller
-def evaluate(traces: Sequence[dict], p: PostLLMParams,
-             min_trades: int = MIN_TRADES) -> tuple[float, dict]: ...
-```
-Pipeline: `rescore_traces(traces, p)` → feed into **PerformanceReport's overall-metrics computation** → objective = `expectancy_per_trade` (mean actual_rr over all alerts, no_trade counted as 0). Returns `(-inf, metrics)` when `taken_trades < min_trades`. `metrics` always returned (even on -inf) so the report can show why a fold was rejected.
-
-## Correctness Criteria
-- expectancy = mean(actual_rr) over the re-scored set with no_trade=0 — matches PerformanceReport's definition exactly (REUSE it; do not recompute the mean independently).
-- taken_trades is counted on the RE-SCORED set, not the raw set.
-- Deterministic.
-- `-inf` strictly below `min_trades`; finite at exactly `min_trades`.
-
-## Test Strategy
-- Unit: known traces + known params → hand-computed expectancy.
-- Unit: below MIN_TRADES → -inf, metrics still populated.
-- Integration: default params over real trace_traces.jsonl → expectancy equals PerformanceReport's own overall expectancy on the unfiltered file (sanity tie-out).
-
-## Dependencies
-REUSES `PerformanceReport` metric computation (workspace/backtesting/report.py) and rescore.
-
-## Risks & Open Questions
-- If PerformanceReport's expectancy definition differs from "mean actual_rr with no_trade=0," the brief's objective and the reused metric could diverge. The Executor must confirm the exact PerformanceReport field and use IT as the single source of truth; if mismatched, flag rather than silently redefine.
-
----
-
-# Component: search
-## Purpose
-Grid search over PostLLMParams on a training slice.
-
-## Interface
-`workspace/tuning/search.py`
-```
-def best_params(train_traces: Sequence[dict],
-                grid: Iterable[PostLLMParams],
-                min_trades: int) -> tuple[PostLLMParams, float, dict]: ...
-```
-Returns the params with max objective, its score, its metrics. Ties broken deterministically (e.g. first in grid order, or a documented secondary key — pick one and document). If every grid point is below min_trades, returns the default/baseline params with their (-inf or finite) score so the fold still produces a comparable record — **document this fallback**.
-
-## Correctness Criteria
-- Returns the argmax; deterministic tie-break.
-- Pure function of (train_traces, grid, min_trades).
-- Never returns params unseen in the grid.
-
-## Test Strategy
-- Unit: synthetic traces where one param is provably best.
-- Unit: deterministic tie-break with two equal-scoring params.
-- Unit: all-below-min_trades fallback behavior.
-
-## Dependencies
-REUSES objective.evaluate.
-
-## Risks & Open Questions
-- Tie-break choice is a judgment call; must be fixed and documented so walk-forward stability analysis is meaningful.
-
----
-
-# Component: walkforward
-## Purpose
-Rolling train/test split by timestamp; pick best (config, params) on each train slice, evaluate on the next unseen test slice, and compare to baseline on the same test windows.
-
-## Interface
-`workspace/tuning/walkforward.py`
-```
-@dataclass(frozen=True)
-class Fold:
-    train: list[dict]; test: list[dict]
-    train_start: str; train_end: str; test_start: str; test_end: str
-
-def make_folds(traces: Sequence[dict], train_days: int, test_days: int,
-               step_days: int) -> list[Fold]: ...
-
-@dataclass(frozen=True)
-class FoldResult:
-    fold: Fold
-    chosen_config: TradingConfig
-    chosen_params: PostLLMParams
-    is_expectancy: float
-    oos_expectancy: float
-    oos_metrics: dict
-    baseline_oos_expectancy: float
-    baseline_oos_metrics: dict
-
-@dataclass(frozen=True)
-class WalkForwardResult:
-    folds: list[FoldResult]
-    # plus aggregates computed in report (or precomputed here, document which)
-
-def run_walkforward(trace_sets: Mapping[str, list[dict]],  # config_hash -> traces
-                    folds: list[Fold],
-                    grid: Iterable[PostLLMParams],
-                    min_trades: int) -> WalkForwardResult: ...
-```
-`trace_sets` maps each pre-LLM config's hash to its full-span recorded traces (Tier-2 output, or just `{baseline_hash: baseline_traces}` for the free path). `make_folds` operates on the BASELINE config's timestamps to define fold date bounds; per-config traces are then sliced to those same date bounds — so all configs share identical fold windows.
-
-**Fold construction (rolling, by timestamp, no leakage):**
-- Sort by ISO timestamp. Window start advances by `step_days`. For each window: train = `[start, start+train_days)`, test = `[start+train_days, start+train_days+test_days)`.
-- A trace falls in at most one of {train, test} of a given fold (half-open intervals; no boundary double-count). The critical invariant: **for every fold, train and test sets are disjoint by timestamp** — assert it.
-
-**Per fold:** over the product (pre-LLM configs × post-LLM grid), score each (config, params) on that fold's TRAIN slice of that config's traces; pick the argmax → (chosen_config, chosen_params, is_expectancy). Evaluate that SAME choice on the fold's TEST slice of that config's traces → oos. Separately evaluate BASELINE (default config + default params) on the same TEST window → baseline_oos.
-
-## Correctness Criteria
-- **No leakage:** assert train∩test = ∅ per fold (by timestamp). This is the phase's most important invariant — a dedicated test must try to break it.
-- Rolling: consecutive folds' starts differ by exactly `step_days`.
-- Half-open intervals prevent boundary trades landing in both train and test.
-- IS computed on train, OOS on test, always disjoint.
-- Baseline OOS uses the baseline config's traces sliced to the SAME test window as the tuned choice — apples-to-apples.
-- Deterministic: same inputs → same folds and same FoldResults.
-- Folds with empty train or empty test are dropped (or flagged), documented.
-
-## Test Strategy
-- Unit: known timestamp sequence → exact expected fold boundaries; assert disjointness on every fold.
-- Adversarial: a trace exactly on a train/test boundary lands in exactly one side; construct it deliberately.
-- Unit: step_days < test_days (overlapping windows across folds is fine) vs ≥ — confirm cross-fold overlap is allowed but intra-fold train/test never overlap.
-- Integration: real traces → folds produced, each FoldResult has IS and OOS, baseline computed.
-- Determinism: two runs identical.
-
-## Dependencies
-REUSES objective.evaluate, search.best_params, PostLLMParams, TradingConfig.
-
-## Risks & Open Questions
-- Timestamp parsing/timezone normalization must be consistent (parse once to comparable datetimes). Mixed tz offsets in traces would corrupt ordering — normalize and document.
-- Sparse data → folds with too few trades; min_trades guard handles scoring but report must surface "fold N degenerate."
-
----
-
-# Component: WalkForwardReport
-## Purpose
-Human-readable honesty report. The deliverable that tells the user whether tuning is real or noise.
-
-## Interface
-`workspace/tuning/report.py`
-```
-class WalkForwardReport:
-    @staticmethod
-    def generate(result: WalkForwardResult,
-                 out_path: str = "workspace/walkforward_report.md") -> str: ...
-    # returns the markdown string AND writes it to out_path
-```
-Mandatory sections:
-1. **Per-fold table:** fold dates, chosen config_hash + chosen params, IS expectancy, OOS expectancy, OOS win rate / profit factor / max_drawdown_r, OOS taken_trades.
-2. **Aggregate OOS vs baseline:** mean OOS expectancy (tuned) vs mean OOS expectancy (baseline), pooled across folds; same for win rate / PF / max_dd.
-3. **Parameter stability:** per-field distribution of chosen params across folds; flag when winners differ wildly fold-to-fold ("unstable → likely noise").
-4. **OVERFITTING WARNING:** emit when aggregate IS ≫ aggregate OOS (configurable gap threshold, documented) OR tuned OOS ≤ baseline OOS. If tuned OOS ≤ baseline OOS, state plainly: *"Tuning added nothing; use baseline."*
-5. **Disclaimers:** carry forward the Phase 3A optimism disclaimer verbatim-in-spirit, PLUS a leakage note: the LLM's training data overlaps the backtest period, so even OOS numbers here are optimistic relative to truly unseen future data.
-6. Degenerate-fold note for folds below min_trades.
-
-## Correctness Criteria
-- Every fold appears in the table.
-- Aggregates are pooled/averaged by a documented rule (trade-weighted vs fold-equal — pick one, justify; recommend reporting both mean-of-folds and trade-weighted to avoid hiding small-sample folds).
-- Overfitting warning fires under both trigger conditions; test both.
-- Both disclaimers always present.
-- Pure function of result (no recomputation that could disagree with walkforward — read aggregates from result/objective metrics, don't re-derive expectancy a third way).
-
-## Test Strategy
-- Unit: result where tuned OOS ≤ baseline → "tuning added nothing" present.
-- Unit: result where IS ≫ OOS → overfitting warning present.
-- Unit: unstable params across folds → instability flag present.
-- Unit: disclaimers always rendered.
-- Snapshot: deterministic markdown for a fixed result (modulo a stamped timestamp, which should be excluded or fixed in tests).
-
-## Dependencies
-REUSES metrics already in FoldResult (which came from PerformanceReport) — does not recompute trade math.
-
-## Risks & Open Questions
-- Aggregation rule choice materially changes the headline; documenting and showing both protects honesty.
-- "Wildly different" stability threshold is heuristic — make it explicit and conservative.
-
----
-
-# Component: scripts/run_tuning.py + Tier-2 recording loop
-## Purpose
-CLI entry. Default path: post-LLM tuning over an existing trace file, ZERO LLM calls. `--record`: cost-gated Tier-2 sweep first, then tune over the union of recorded configs.
+Pure, stateless fib grid over the most-recent confirmed dealing range. Supplies the golden pocket, OTE grid (primary 0.705), 0.382 retracement target, and negative std-dev extensions used as DOL/expansion targets. Numbers MUST agree with `premium_discount` because both anchor identically.
 
 ## Interface
 ```
-run_tuning.py
-  --traces-dir PATH        # dir of already-recorded trace sets (per config_hash subdirs)
-                           # or a single trade_traces.jsonl for the baseline-only path
-  --record                 # enable Tier-2: record each PreLLMGrid config first (cost-gated)
-  --pre-llm-grid SPEC      # selects the PreLLMGrid (default: single baseline config)
-  --train-days N --test-days N --step-days N
-  --min-trades N
-  --out PATH               # default workspace/walkforward_report.md
-  --yes / non-interactive  # mirror Phase 3A spend-gate confirmation
+detect_fibonacci(
+  candles,
+  lookback=2,
+  retracements=(0.382, 0.5, 0.618, 0.66, 0.705, 0.79),
+  ote_grid=(0.5, 0.62, 0.705, 0.79),
+  ote_primary=0.705,
+  golden_pocket=(0.618, 0.66),
+  retracement_target=0.382,
+  extensions=(-0.5, -1.0, -1.5, -2.0, -2.5),
+  swings=None,            # repair #8: optional precomputed detect_swings output
+) -> list[dict]           # length 0 or 1
 ```
-**Default (no --record):** load baseline trade_traces.jsonl → `trace_sets = {baseline_hash: traces}` → make_folds → run_walkforward over post-LLM grid → report. No engine, no API key, no LLM calls. Must work offline.
-
-**Tier-2 recording loop (--record):** cost math — `LLM cost = n_pre_llm_configs × ONE full-span backtest`. Folds do NOT multiply cost: a config's LLM output for a timestamp is fold-independent, so record each config ONCE over the whole span and slice per fold by timestamp.
-Procedure:
-1. For each config in PreLLMGrid: REUSE `TriggerCalibrator` to estimate `total_fires`; estimated cost = `total_fires × $0.003`. Sum across grid.
-2. Print per-config and total estimate; **gate behind confirmation** mirroring the Phase 3A spend gate (refuse to spend without `--yes` or interactive confirm).
-3. On confirm, for each config: REUSE `BacktestEngine` (idempotent resume) to write `workspace/tuning/runs/{config_hash}/trade_{alerts,traces}.jsonl`. Per-config directory prevents ledger collision; idempotent resume means a re-run skips already-recorded fires.
-4. Load all `runs/{hash}/trade_traces.jsonl` → `trace_sets` keyed by hash → walk-forward as above.
-Model selection via `KyrosAgentLoader.get_model_engine("trading", fallback_role="executor")`.
+Output dict keys (single element):
+```
+type: "fibonacci"
+range_high, range_low       (floats)
+direction                   ("up" | "down")
+equilibrium                 (price @ f=0.5)
+golden_pocket               [price_lo, price_hi]   (sorted ascending)
+ote: {
+  "0.5", "0.62", "0.705", "0.79"  (prices at each grid ratio present),
+  primary                        (price @ ote_primary = 0.705),
+  zone: [min(price(0.62),price(0.79)), max(price(0.62),price(0.79))]  # repair #3
+}
+retracements                {ratio: price for ratio in retracements}
+retracement_target          (price @ 0.382)
+extensions                  {"-0.5","-1.0","-1.5","-2.0","-2.5": price}
+premium_array               (bool: current price > equilibrium)
+index                       (confirming swing index)
+timestamp                   (confirming swing timestamp)
+```
 
 ## Correctness Criteria
-- Default path makes provably ZERO LLM calls (test asserts engine/loader never invoked, runs with no API key).
-- Cost estimate printed and confirmed BEFORE any spend; declining aborts with zero spend.
-- Each config recorded exactly once over full span; fold slicing is by timestamp only.
-- Per-config output paths isolated by config_hash; no cross-config ledger contamination.
-- Re-run with same configs resumes idempotently (no duplicate fires, no double spend).
-- Determinism of the tuning stage given fixed recorded inputs.
+- Anchor: reuse `detect_swings` (via `swings` arg if provided, else call it with `lookback`). Take most-recent confirmed swing-high and swing-low. `direction="up"` if low index < high index else `"down"`. `range_high`/`range_low` from those two swing prices.
+- Edge cases → `[]`: empty candles, fewer than the swing pair, degenerate range (`range_high == range_low`).
+- Level math, direction-aware, IDENTICAL to premium_discount convention: `R = range_high - range_low`; up → `price(f) = range_high - f*R`; down → `price(f) = range_low + f*R`. Negative `f` extends beyond the origin extreme (up→above high, down→below low).
+- `ote.zone` derives from EXPLICIT ratios `price(0.62)` and `price(0.79)` via `min`/`max` — NOT `ote_grid[1]`/`ote_grid[-1]` (repair #3). A reordered or shortened `fib_ote_grid` must not raise `IndexError` nor produce a wrong zone.
+- Carry premium_discount's flagged dealing-range ambiguity note verbatim (same comment text/behavior when high/low ordering is ambiguous).
+- `premium_array` uses the latest candle close as "current price".
+- Pure: no I/O, no globals, no mutation of inputs.
 
-## Test Strategy
-- Integration (offline, no key): default path over a fixture trade_traces.jsonl produces a report; assert no LLM/engine call occurred.
-- Unit: cost math = n_configs × calibrator estimate × $0.003; decline → abort, zero spend (mock calibrator + mock confirm).
-- Unit: config_hash directory routing; two configs → two disjoint run dirs.
-- Integration: idempotent resume — second --record run with a fully-recorded config performs zero new fires (mock engine to count).
+## Test Strategy (tests/test_fibonacci.py)
+Unit, using `MockCandleSource` producing a clean 100→200 range:
+- **up** (low precedes high): equilibrium `150.0`; golden_pocket `[134.0, 138.2]`; ote.primary `129.5`; ote.zone `[121.0, 138.0]`; retracement_target `161.8`; extensions `{-0.5:250, -1:300, -1.5:350, -2:400, -2.5:450}`.
+- **down** (high precedes low): equilibrium `150.0`; golden_pocket `[161.8, 166.0]`; ote.primary `170.5`; ote.zone `[162.0, 179.0]`; retracement_target `138.2`; extensions `{-0.5:50, -1:0, -1.5:-50, -2:-100, -2.5:-150}`.
+- Edge: empty→`[]`; single candle→`[]`; degenerate flat range→`[]`.
+- Repair #3 regression: pass `ote_grid=(0.705, 0.5)` (reordered, len 2) and `ote_grid=(0.705,)` → no crash, `zone` still from explicit 0.62/0.79.
+- Purity: identical input twice → identical output; input list unmutated.
+- `swings` passthrough: precomputed swings arg yields same result as internal call.
 
-## Dependencies
-REUSES TriggerCalibrator (cost), BacktestEngine (recording + idempotent resume), KyrosAgentLoader (model selection), and the whole tuning stack above. Backtesting calibrator output-path parameterization is the permitted backtesting extension.
+## Dependencies (REUSED)
+`detect_swings` (anchor). Fib price(f) convention mirrored from `detect_premium_discount` (read-only reference — do not import its private helpers; replicate the documented formula).
 
 ## Risks & Open Questions
-- Whether the calibrator currently supports a parameterized output path / per-config run dir — the brief permits extending it; confirm the extension stays within its existing correctness contract.
-- `--pre-llm-grid SPEC` format is unspecified; recommend a small named-preset registry rather than free-form CLI to keep configs reproducible and hashable.
+- Ambiguous swing ordering must resolve the same way premium_discount does — Executor must read that module to match, not to edit it.
+- Float formatting: canonical numbers assume exact arithmetic on the 100→200 range; keep full precision internally, 2dp only at the `_fib_dict` serializer boundary.
 
 ---
 
-## EXECUTOR CHECKLIST (ordering & gates)
-1. **Resolve O0** (conviction default) by reading code + fixtures. Set the byte-preserving default.
-2. Build `TradingConfig`; audit every literal call site (grep list); pass the **unedited Phase 1/2/3A suite** (P0 gate). STOP if any test needs behavioral edits.
-3. Confirm trace_traces.jsonl schema field names; pin them in rescore.
-4. Confirm PerformanceReport's exact expectancy field; make it the single source for objective.
-5. Build params → rescore → objective → search → walkforward (leakage assertion is a release blocker) → report.
-6. Build run_tuning default (zero-LLM) path; verify offline with no API key.
-7. Build Tier-2 recording behind the cost gate last.
+# Component: LiquidityPool scope/role + IRL sources + scope refinement (snapshot.py `_build_pools`)
 
-No implementation code is included by design. The two STOP-and-flag conditions (O0 non-preserving default; any Phase 2 behavioral test change) are hard prerequisites, not design problems to route around.
+## Purpose
+Tag every pool as ERL/IRL with a role, add the missing IRL pool sources, and reconcile scope against the HTF dealing range so the scorer never trusts a pool whose role and scope disagree.
+
+## Interface
+`LiquidityPool` gains (all defaulted → existing constructors stay valid):
+```
+scope: str = "external"
+role: str = ""
+clarity_score: float = 0.0        # component 9
+score_breakdown: dict = {}        # component 9 (default-factory empty dict)
+```
+`to_dict()` emits `scope`, `role`, `clarity_score`, `score_breakdown` (**flag: pool golden test updated**).
+
+ERL sources (scope="external"):
+- equal highs/lows → role `"equal"`
+- prior day/week → role `"prior"`
+- session H/L/open → role `"session"`
+- NEW: most-recent major swing high/low from `detect_swings` → role `"swing"` (canonical ERL)
+
+IRL sources (scope="internal", gated by `config.irl_sources`):
+- FVG midpoint (reuse `detect_fvg`'s `midpoint`) → role `"fvg_ce"`
+- unmitigated OB centre `(top+bottom)/2` → role `"ob_ce"`
+- dealing-range equilibrium (from fib) → role `"equilibrium"`
+- fib OTE 0.705 → role `"ote"`
+
+## Correctness Criteria
+- **Repair #4 — derive scope ONCE, reconcile:** when an HTF dealing range exists (fibonacci on the first non-empty TF in `htf_tf_order`), a level strictly inside `(range_low, range_high)` → `internal`; at/beyond a boundary → `external`. Otherwise the source-type default applies. Scope is computed once per pool; role is then reconciled so no pool has `role="swing"` while `scope="internal"` contradicting the range test — the range-derived scope wins and the role is retained for weighting. Document the precedence explicitly.
+- **Repair #5 — dedup:** coincident pre-existing ERL sources merge on `(level, type)`, keeping the RICHEST role (fixed priority: `equal > prior > session > swing`) and counting `confluence_count` on the merged set — no double-count, no inflated candidate list.
+- **Repair #8 — thread precomputed detectors:** `_build_pools` accepts already-computed `swings`, `fvgs`, `order_blocks`, and the TF's `fibonacci` result; no detector runs 2–3× per TF on the same candles.
+- Existing ERL construction and existing field defaults stay byte-identical; new sources are purely additive.
+
+## Test Strategy (tests/phase2/)
+- ERL/IRL classifier unit: fixture with equal highs, prior day, session, a swing, an FVG, an OB, plus fib → assert each pool's `scope`/`role`.
+- Scope refinement: pool inside HTF range → internal even if source is a swing; pool at boundary → external.
+- Repair #4: role/scope reconciliation — swing inside range does not emerge as `internal`+`swing` in a state the scorer treats as external.
+- Repair #5: two coincident equal-high + prior pools at same `(level,type)` merge to one, richest role, correct confluence count.
+- Repair #8: assert detectors invoked once per TF (spy/count on MockCandleSource-backed detector calls).
+- `irl_sources` gating: dropping `"ote"` removes ote pools only.
+
+## Dependencies (REUSED)
+`detect_swings`, `detect_fvg` (`midpoint`), `detect_order_blocks`, and this phase's `detect_fibonacci`.
+
+## Risks & Open Questions
+- Which TF supplies the equilibrium/OTE IRL pools when multiple TFs have fib? Spec: HTF dealing range = first non-empty TF in `htf_tf_order`. Keep IRL equilibrium/ote sourced from that same range for consistency with scope refinement.
+
+---
+
+# Component: _derive_liquidity_cycle (snapshot.py, SnapshotBuilder)
+
+## Purpose
+Express WHERE in the ERL→IRL→ERL cycle price is, from the most-recent sweep. Stateless, single-snapshot heuristic — no cross-snapshot memory.
+
+## Interface
+```
+_derive_liquidity_cycle(self, recent_sweeps, market_structure,
+                        displacements, htf_bias) -> dict | None
+```
+Returns `None` if no sweep exists, else:
+```
+{
+  last_swept_erl_side: "buyside" | "sellside",
+  last_swept_level: float,
+  last_swept_timestamp,
+  current_leg: "seek_irl" | "expand_to_erl",
+  next_draw: "irl" | "erl",
+  target_erl_side: "sellside" | "buyside",   # opposite of last_swept
+  agrees_with_htf_bias: bool,
+}
+```
+
+## Correctness Criteria
+- Most-recent sweep across timeframes → `last_swept_erl_side` = "buyside" if BSL swept, "sellside" if SSL swept; `target_erl_side` = opposite.
+- `current_leg = "expand_to_erl"` iff a reversal-direction displacement OR BOS occurred strictly AFTER the sweep timestamp; else `"seek_irl"`.
+- `next_draw = "irl"` when `seek_irl`, `"erl"` when `expand_to_erl`.
+- `agrees_with_htf_bias` = does `target_erl_side` match `htf_bias` direction (buyside↔bullish, sellside↔bearish).
+- Documented as stateless/derived-fresh; no persistence.
+
+## Test Strategy
+- Sweep-of-BSL, no subsequent displacement → seek_irl, target sellside, next_draw irl.
+- Sweep-of-SSL followed by bullish BOS → expand_to_erl, target buyside, next_draw erl.
+- No sweep → None.
+- `agrees_with_htf_bias` true/false cases against both bias directions.
+
+## Dependencies (REUSED)
+Liquidity sweep detection, `detect_structure` (BOS), `detect_displacement` — all read-only, outputs consumed via the existing snapshot pipeline.
+
+## Risks & Open Questions
+- "After the sweep" ordering must use timestamps consistently across TFs. Tie: a displacement at the same timestamp as the sweep is NOT "after" → seek_irl. Document.
+
+---
+
+# Component: Weighted DOL scoring — _score_pool / _rank_dols / _dol_target (snapshot.py)
+
+## Purpose
+Choose the DOL by a deterministic weighted CLARITY score, not proximity. The nearest pool is a first-TP waypoint ("Low Hanging Fruit"), not the dominant draw. Expose a ranked list; `dol_target` = argmax.
+
+## Interface
+```
+_score_pool(self, pool, *, htf_bias, cycle, htf_fib, current_price,
+            killzone, pools) -> tuple[float, dict]     # (score, breakdown)
+
+_rank_dols(self, pools, *, htf_bias, cycle, htf_fib, current_price,
+           killzone) -> list[LiquidityPool]           # sorted clarity desc
+
+_dol_target(self, pools, cycle, htf_bias, current_price) -> LiquidityPool | None
+```
+
+## Correctness Criteria
+`_score_pool` is PURE (same args → same score+breakdown). Linear sum of weighted factor terms, each mapping to an EXISTING signal; `breakdown` itemizes every factor's contribution:
+- `timeframe` : `pool.timeframe → config.tf_weights` (4h ≫ 1h ≫ 15m ≫ 5m ≫ 1m)
+- `role` : `pool.role → config.role_weights` (equal > prior > session > swing > fvg_ce/ob_ce/equilibrium/ote)
+- `cycle_align` : large + when pool matches `cycle` (expand_to_erl → external on `target_erl_side`; seek_irl → internal in reversal direction)
+- `bias_align` : + when pool side agrees with `htf_bias` (bsl&bullish / ssl&bearish)
+- `confluence` : `+ w * pool.confluence_count`
+- `pd_align` : + when reaching the pool moves price across `htf_fib.equilibrium` toward the opposite side; penalize if already spent
+- `clean_path` : `− w * (count of OPPOSING unswept EXTERNAL pools strictly between current_price and pool.level)` — the LRLR / intermediate-liquidity guard, numeric (repair #6)
+- `proximity` : `+ small w * (distance_points / R)` — LOW weight, tiebreak only, so LHF cannot dominate
+- `killzone` : `+ small w` if `current_killzone` set (optional)
+
+`_rank_dols`:
+- **Repair #2 — filter to correct side FIRST:** for a buyside draw keep pools above price; for a sellside draw keep pools below price. Structurally prevents a wrong-side target.
+- Score each survivor, sort by `clarity_score` DESC with a **stable distance tiebreak**.
+
+`_dol_target` (REWRITTEN):
+- `cycle is None` or `config.dol_use_cycle is False` → fall back to `_nearest_dol` over the **ERL-only** pool set (repair #1). `_nearest_dol` stays byte-identical.
+- else → `_rank_dols(...)[0]` or `None`.
+- Bias conflict → prefer `htf_bias` and set `cycle.agrees_with_htf_bias = False`.
+- **DELETE** the bespoke first-match `_nearest_internal` / `_nearest_external` (subsumed by scoring).
+
+## Test Strategy
+- Each factor monotonic in isolation (raise one input, hold others → score rises/falls as signed).
+- **Core proximity test:** a farther Weekly/Daily ERL beats a nearer weak 5m pool — proximity does NOT dominate.
+- `clean_path`: inserting an opposing unswept ERL between price and a candidate lowers its score below a clean candidate.
+- Side filter: a wrong-side pool is never returned by `_rank_dols`/`_dol_target`.
+- Fallback: `dol_use_cycle=False` reproduces `_nearest_dol` on the ERL-only set exactly.
+- Determinism: same window+config → identical ranking and breakdowns.
+- `breakdown` sums to `clarity_score`.
+
+## Dependencies (REUSED)
+Pool set from `_build_pools`; `htf_fib` from `detect_fibonacci`; cycle from `_derive_liquidity_cycle`; existing `_nearest_dol`.
+
+## Risks & Open Questions
+- Weight defaults must encode KB ORDERING without being justified BY the KB — each weight ties to a deterministic signal; Phase 3B tunes them later. Ship conservative defaults where cycle_align > tf > role > pd/bias > confluence > clean_path magnitude ≫ proximity.
+- Ensure `R` for proximity normalization is well-defined when no HTF fib exists → use a documented fallback (e.g. current-TF range) or set proximity term to 0.
+
+---
+
+# Component: MarketSnapshot wiring + serializer (snapshot.py `build`, `_compact_dict`, mappers)
+
+## Purpose
+Populate and expose the new fields without changing serializer shape beyond the flagged additive keys.
+
+## Interface
+New `MarketSnapshot` fields:
+```
+fib_levels: dict[str, list[dict]]   # per-TF
+liquidity_cycle: dict | None
+dol_target: LiquidityPool | None
+ranked_dols: list[LiquidityPool]
+```
+`build()` order per spec: fill `fib_levels[tf] = detect_fibonacci(...)` (threading precomputed swings), then pools (IRL + scope refinement), then `liquidity_cycle`, then `ranked_dols`, then `dol_target == ranked_dols[0]`.
+
+New mappers:
+- `_fib_dict` — per-TF latest, 2dp: `direction, equilibrium, golden_pocket, ote_primary, ote_zone, retracement_target, extensions, premium_array`.
+- `_ranked_dol_dict` — carries `clarity_score` + `score_breakdown`.
+
+`_compact_dict` gains `fib_levels`, `liquidity_cycle`, `dol_target`, `ranked_dols` (top-N via `config.ranked_dols_to_llm`). **Flag: snapshot golden test updated.**
+
+## Correctness Criteria
+- `dol_target` is identically `ranked_dols[0]` (or None).
+- Serializer shape otherwise UNCHANGED; new keys additive.
+- Determinism preserved.
+
+## Test Strategy
+- Snapshot integration: full build over MockCandleSource emits all new fields; goldens updated for scope/role/clarity_score/ranked_dols.
+- `ranked_dols_to_llm` truncation respected in compact dict.
+- `_fib_dict` 2dp rounding matches canonical numbers.
+
+## Dependencies (REUSED)
+All of the above components.
+
+## Risks & Open Questions
+- Golden churn: exactly the two flagged goldens (pool-dict, compact/snapshot) change. Any other golden diff signals an unintended non-additive change — treat as a defect.
+
+---
+
+# Component: ICT_SYSTEM_PROMPT (reasoning_agent.py)
+
+## Purpose
+Teach the reasoning layer to read the cycle before choosing direction/DOL, use the ranked DOLs, and apply golden-pocket/OTE entries and 0.382 + negative-extension targets. **Output JSON schema / AlertPayload / parser UNCHANGED.**
+
+## Interface (prompt-only)
+- **Repair #7 — reorder:** cycle read PRECEDES direction selection (remove the "1, 2, 1.5, 3" ordering). Read `liquidity_cycle` (last swept side, current_leg, target ERL) first.
+- DOL step reads `ranked_dols` (already scored/sorted), defaults to top `clarity_score`, and MAY override only with a NAMED higher-order signal (SMT, macro/killzone) it must state.
+- Briefly define each `score_breakdown` factor for the model.
+- Intermediate-liquidity: only an unswept opposing EXTERNAL (ERL) pool between entry and target blocks the path → no_trade; internal arrays in the path are expected, not blockers (repair #6).
+- OTE modifier: +15 conviction if entry in golden pocket (0.618–0.66); +10 more at 0.705 primary.
+- Entry logic: premium arrays (above equilibrium) → short toward discount/sellside ERL; discount arrays (below) → long toward buyside ERL; entries at golden pocket / OTE 0.705; targets = 0.382 partial then negative extensions toward the opposite ERL.
+
+## Correctness Criteria
+- No change to the emitted JSON keys, AlertPayload, or parser.
+- Prompt references only fields actually present in the compact dict.
+
+## Test Strategy
+- Mocked-LLM end-to-end: feed a snapshot with a defined cycle + ranked_dols; assert the (mocked) reasoning path selects `dol_target` unless it names an override, and the parser still produces a valid AlertPayload unchanged in schema.
+- Regression: existing reasoning_agent parser tests stay green.
+
+## Dependencies (REUSED)
+Existing reasoning_agent scaffolding and parser (unchanged).
+
+## Risks & Open Questions
+- Prompt must not imply new output fields. Keep the schema section untouched; only the reasoning/instruction sections change.
+
+---
+
+# Component: TradingConfig knobs (config.py)
+
+## Purpose
+Add hashable, byte-preserving fib + IRL + weighting knobs; expose via `config_hash()`; add the recency cap. Tunable by Phase 3B later (which is otherwise untouched).
+
+## Interface
+Immutable/hashable, defaults byte-preserving:
+```
+fib_retracements = (0.382,0.5,0.618,0.66,0.705,0.79)
+fib_golden_pocket = (0.618,0.66)
+fib_ote_grid = (0.5,0.62,0.705,0.79)
+fib_ote_primary = 0.705
+fib_retracement_target = 0.382
+fib_extensions = (-0.5,-1.0,-1.5,-2.0,-2.5)
+fib_anchor_lookback = 2
+irl_sources = ("fvg","order_block","equilibrium","ote")
+dol_use_cycle = True
+ranked_dols_to_llm = 5
+```
+Tuple-of-tuples mirroring `_DEFAULT_RECENCY_CAPS`, each with a `*_dict()` accessor:
+```
+_DEFAULT_DOL_WEIGHTS  (factor → weight)
+_DEFAULT_TF_WEIGHTS   (timeframe → weight)   # 4h≫1h≫15m≫5m≫1m
+_DEFAULT_ROLE_WEIGHTS (role → weight)        # equal>prior>session>swing>fvg_ce/ob_ce/equilibrium/ote
+```
+Add `("fib_levels", 1)` to `_DEFAULT_RECENCY_CAPS`. Add every new knob (and the three weight dicts, canonicalized) to the `config_hash()` canonical dict.
+
+## Correctness Criteria
+- Frozen/hashable; `config_hash()` deterministic and stable across runs.
+- Existing default hash for the pre-existing knobs is preserved except for the deliberate additions (document that `config_hash()` value changes — this is expected and any consumer asserting a frozen hash string must update it).
+
+## Test Strategy
+- All new knobs present, defaulted, hashable.
+- `config_hash()` deterministic; canonical dict includes new knobs + weight dicts.
+- `*_dict()` accessors return correct mappings; weight ordering encodes the specified precedence.
+
+## Dependencies (REUSED)
+Existing config machinery (`_DEFAULT_RECENCY_CAPS` pattern, `config_hash`).
+
+## Risks & Open Questions
+- `config_hash()` string changes — confirm no Phase 3B artifact pins the old hash as an immutable contract; if it does, that pin lives in `tuning/` (OFF-LIMITS) and must not be edited — instead ensure Phase 3B consumes the hash dynamically. **Open question flagged for the state file / integration owner.**
+
+---
+
+## Cross-Cutting Test Matrix (summary)
+- `tests/test_fibonacci.py` — exact canonical numbers (up/down), edges, repair #3, purity.
+- `tests/phase2/` — ERL/IRL classifier, scope refinement + repair #4, dedup repair #5, cycle derivation, side-filter repair #2, ERL-only fallback repair #1, clean_path repair #6, factor monotonicity, the proximity-does-not-dominate core test, snapshot integration, mocked-LLM end-to-end.
+- Pre-existing Phase 1/2/3A/3B suite stays green EXCEPT the two flagged goldens (pool-dict, compact/snapshot) and any config-hash-string assertion.
+
+## Global Risks
+1. Scope discipline: the strongest failure mode is editing a frozen detector to "make numbers agree." Executor must replicate premium_discount's convention in `fibonacci.py`, never edit premium_discount.
+2. Golden creep: only two goldens may change. Enforce via CI diff review.
+3. Determinism: all new methods pure or deterministic-over-window; no wall-clock, no RNG, no cross-snapshot state.

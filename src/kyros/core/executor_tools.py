@@ -110,8 +110,15 @@ class ExecutorToolkit:
 
     BASH_TIMEOUT = 120  # seconds per command
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, write_roots: list[str] | None = None):
         self.root = root.resolve()
+        # Directories the agent is allowed to WRITE into (relative to root).
+        # Reads/bash stay repo-wide; only write_file is fenced. When None, writes
+        # are allowed anywhere under root (backwards-compatible default).
+        if write_roots is None:
+            self.write_roots: tuple[Path, ...] = (self.root,)
+        else:
+            self.write_roots = tuple((self.root / p).resolve() for p in write_roots)
 
     # ── Public dispatch entry point ────────────────────────────────────────────
 
@@ -136,7 +143,7 @@ class ExecutorToolkit:
     # ── Tool implementations ───────────────────────────────────────────────────
 
     def write_file(self, path: str, content: str) -> str:
-        target = self._safe_path(path)
+        target = self._safe_write_path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         return f"OK: wrote {len(content)} chars to {path}"
@@ -186,4 +193,23 @@ class ExecutorToolkit:
         resolved = (self.root / rel_path).resolve()
         if not resolved.is_relative_to(self.root):
             raise ValueError(f"Path escape: '{rel_path}' resolves outside project root")
+        return resolved
+
+    def _safe_write_path(self, rel_path: str) -> Path:
+        """Resolve a write target and verify it lands inside an allowed write root.
+
+        Reads may range over the whole repo, but writes are fenced to the
+        directories in ``self.write_roots`` (e.g. ``workspace/`` and ``tests/``).
+        This is what stops the Executor from rewriting infrastructure such as
+        ``config/prompts.yaml``, ``main.py``, ``src/``, or ``.kyros_state.json``.
+        """
+        resolved = self._safe_path(rel_path)
+        if not any(
+            resolved == r or resolved.is_relative_to(r) for r in self.write_roots
+        ):
+            allowed = ", ".join(str(r.relative_to(self.root)) or "." for r in self.write_roots)
+            raise ValueError(
+                f"Write denied: '{rel_path}' is outside the allowed write roots "
+                f"({allowed}). Agents may only write inside these directories."
+            )
         return resolved

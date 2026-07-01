@@ -1,125 +1,162 @@
-# Phase 3B Evaluation — Offline Tuning & Walk-Forward Harness
+# Phase 2B Evaluation — Fibonacci Levels & Liquidity-Cycle (ERL→IRL→ERL) / DOL
 
-**Evaluator round:** 1 of 3 (per orchestrator). The contract self-describes as
-"round 3"; I grade independently of that claim.
-**Verdict basis:** independent re-run of pytest + direct invariant probing
-(not the Executor's self-report).
+Round 2 of 3. Independent audit (not self-report). `uv run pytest` executed by the Evaluator.
 
-## Independent verification performed
+## Scope of change reviewed
+- Committed HEAD (`cbbb6c4`) — the Phase 2B feature landing.
+- Uncommitted working-tree diff on `workspace/trading/snapshot.py` and
+  `tests/phase2/test_fib_liquidity_cycle.py` — the round-1 repair (#8) + the
+  promised scoring behavior tests. These constitute the round-2 delta the
+  contract commits to and are evaluated as the state of the phase.
 
-| Check | Method | Result |
-|-------|--------|--------|
-| Full suite | `ALPACA/ANTHROPIC/ZAI_API_KEY="" uv run pytest -q` | **516 passed in 52s** |
-| Phase 3B offline | keys blanked, `pytest tests/phase3b/ -q` | **99 passed** |
-| Frozen detectors | `git diff --name-only HEAD -- workspace/detectors/` | empty |
-| Frozen trading (working tree) | `git diff --stat HEAD -- workspace/trading/` | empty |
-| Frozen backtesting | `git diff --stat HEAD -- workspace/backtesting/` | empty |
-| rescore reuse | crafted fixture, kept vs filtered | byte-identical / no_trade |
-| objective MIN_TRADES | direct call | -inf below, finite at |
-| walk-forward leakage | crafted dated traces + boundary | disjoint, boundary→test |
-| config defaults | direct construction | all literals matched |
+## Test run (offline)
+`ANTHROPIC_API_KEY="" ZAI_API_KEY="" ALPACA_API_KEY="" uv run pytest`
+→ **566 passed, 1 failed**.
 
-## Invariant-by-invariant findings
+The single failure is `tests/test_agent_loader.py::test_evaluator_prompt_includes_current_round_context`,
+which hardcodes `"round 1 of 3"` in an assertion. It fails only because the
+orchestrator round counter is now 2. This is an orchestration-harness fixture
+outside the Phase 2B carve-out (`workspace/detectors/`, `workspace/trading/`,
+`tests/test_fibonacci.py`, `tests/phase2/`); it is not caused by any Phase 2B
+code and does not require a live key. Not attributable to the Executor's work,
+not a Phase 2B regression. Phase 2B suites are fully green:
+- `tests/test_fibonacci.py` + `tests/phase2/test_fib_liquidity_cycle.py`: 39 passed.
+- `tests/phase2/test_snapshot.py` (pre-existing): 24 passed — no golden edited.
 
-### a. Frozen boundaries — PASS
-`workspace/detectors/`, `workspace/trading/`, and `workspace/backtesting/` have
-empty working-tree diffs vs HEAD. The trading-layer config threading is
-committed (per `git log`, in the Phase 2/3A history), and the only behavioral
-content is reading config fields whose defaults equal the old literals. No
-behavioral change to the trading layer beyond optional-config threading.
+---
 
-### b. TradingConfig behavior-preserving — PASS
-- The **unedited** Phase 1/2/3A suite (417 pre-existing tests) is green inside
-  the 516-total run; no test was edited to accept new behavior.
-- Direct construction confirms every documented literal:
-  `rr_min=1.0`, `conviction_min=40`, `no_trade_cooldown_minutes=5`,
-  `confluence_band_pct=0.001`, `pools_to_llm=5`, `htf_tf_order=("4h","1h")`,
-  recency caps 10 (sweeps/displacements/inducements) / 5 (swings/fvg/ifvg/ob/
-  breaker/volume_imbalance) / 3 (opening_gaps/po3).
-- O0 (conviction default 40) is justified: `validate_rr` short-circuits on
-  `bias=="no_trade"` before the conviction gate, and the audit shows all taken
-  trades ≥ 40, so default-40 is a no-op on current inputs. Defensible.
-- `config_hash()` is sha256 over a json-canonicalized, key-sorted blob (never
-  builtin `hash()`): stable across constructions, sensitive to field changes.
-  Verified directly.
+## Invariant verification
 
-### c. Re-scoring reuses recorded outcomes — PASS
-Direct fixture probe (`/tmp/audit.py`):
-- KEEP params → recorded `win` outcome returned **byte-identical**
-  (`actual_rr==2.5`), input not mutated.
-- FILTER params (conviction_min 70 > 65) → outcome becomes `no_trade`,
-  `actual_rr=None` (counted 0). Input unchanged.
-- Idempotent. `OutcomeSimulator` never imported on this path.
-Filters only downgrade taken trades; non-taken (no_trade/no_fill/expired/
-cancelled) are untouched. R:R recomputed from geometry via shared `compute_rr`
-mirroring `validate_rr`.
+### a. Frozen-boundary carve-outs — PASS
+`git diff HEAD~1 HEAD -- detectors/` = only NEW `fibonacci.py` + additive
+import/`__all__` lines in `__init__.py`. No other detector touched.
+`trading/` diff is additive: new snapshot fields, `LiquidityPool` scope/role/
+clarity_score/score_breakdown, IRL pools, cycle + DOL methods, `_fib_dict`/
+`_ranked_dol_dict`, compact keys, prompt, config knobs. `_nearest_dol` body is
+byte-identical to the pre-2B version (signature reflowed to one line; logic
+unchanged). No non-additive change to an existing default.
 
-### d. Objective + MIN_TRADES guard — PASS
-`evaluate()` re-scores then calls `PerformanceReport()._overall_metrics`,
-reading `expectancy` (= `_expectancy`, mean actual_rr, no_trade=0) and
-`filled_count`. It does **not** reimplement the metric. Below `min_trades` →
-`(-inf, metrics)` with metrics still populated; finite at exactly min_trades
-(verified: 5 traces, min_trades=10 → -inf; min_trades=5 → 2.5).
+### b. detect_fibonacci pure & numerically EXACT — PASS
+Independently constructed 100→200 both directions:
+- up: equilibrium 150.0, golden_pocket [134.0,138.2], ote.primary 129.5,
+  retracement_target 161.8, extensions {-0.5:250 … -2.5:450}. ✓
+- down: golden_pocket [161.8,166.0], ote.primary 170.5,
+  retracement_target 138.2, extensions {-0.5:50 … -2.5:-150}. ✓
+Empty / single-candle / degenerate (high==low) → `[]`. ✓
+No I/O, no globals, no pandas; reuses `detect_swings` read-only and mirrors the
+premium_discount price(f) convention without importing its privates.
 
-### e. Walk-forward rolling + no leakage — PASS (most important)
-Independent probe (`/tmp/wf.py`) on 12 daily traces, train=3/test=2/step=2:
-- 5 folds; consecutive starts differ by exactly step_days (2).
-- Every fold: `train_end == test_start`, train precedes test, **train∩test=∅**.
-- Adversarial boundary trace at `train_end` lands in **test only** (half-open).
-- `_assert_disjoint` runs per fold as a release-blocker assertion.
-Baseline OOS is evaluated on the baseline config's same test window —
-apples-to-apples.
+### c. ERL/IRL classification — PASS
+FVG midpoint inside the dealing range → scope "internal", role "fvg_ce".
+Equal highs / swings at/beyond the boundary → "external". Range-relative
+refinement flips the source default when a level crosses a boundary
+(verified: swings at 140/160 inside a 100–200 range refined to "internal").
 
-### f. Honesty diagnostics — PASS
-`report.py` emits all six numbered sections: (1) per-fold IS/OOS table,
-(2) tuned-vs-baseline OOS (both mean-of-folds and trade-weighted),
-(3) parameter stability with an explicit <60% instability flag, (4) overfitting
-warning firing on BOTH conditions (IS−OOS > 0.5R, and tuned OOS ≤ baseline →
-"Tuning added nothing; use baseline."), (5) Phase 3A optimism disclaimer +
-LLM-leakage note, (6) degenerate-fold note. test_report.py (14 tests) green.
+### d. Cycle-state derivation — PASS
+Latest `sweep_bsl`, no post-sweep reversal → last_swept_erl_side "buyside",
+target_erl_side "sellside", current_leg "seek_irl". A reversal displacement/BOS
+strictly after the sweep timestamp → "expand_to_erl". No sweep → None. Derived
+fresh each build from `recent_sweeps`/`market_structure`/`displacements`; no
+cross-snapshot state.
 
-### g. Tier-2 recording safety — PASS
-`scripts/run_tuning.py`: `estimate_recording_cost` uses `TriggerCalibrator`
-(no LLM) and gates spend (`--yes` or interactive `y`; non-interactive without
-`--yes` → exit 1, zero spend). Each config records to
-`workspace/tuning/runs/{short_hash}/` — no shared ledger path across configs.
-LLM agent built lazily only inside `record_config`/`_build_reasoning_agent`.
+### e. / i. Cycle-aware DOL AUGMENTS via weighted ranking — PASS
+(Invariant i supersedes e.) `_dol_target`:
+- cycle None or `dol_use_cycle` False → `_nearest_dol` over the **ERL-only**
+  set (repair #1). Verified: an internal pool nearer than an external one is
+  correctly ignored in the fallback; `_nearest_dol` still byte-identical.
+- cycle active → `_rank_dols(...)[0]`.
+`_score_pool` pure (same args → identical (score, breakdown)). Direction filter
+applied FIRST: a wrong-side pool (bsl below price on a buyside draw) is
+structurally excluded (verified). Confluence/tf/role monotonic (verified rise).
+Proximity is a low-weight tiebreak: a far Weekly/Daily equal (4h) beats a near
+weak 1m swing (verified `ranked[0] is far`). `dol_target == ranked_dols[0]`;
+`ranked_dols` sorted by clarity_score desc; `score_breakdown` itemized and sums
+to the score. Double-build is deterministic.
 
-### h. Offline — PASS
-`tests/phase3b/` (99 tests) pass with all keys blanked; tests `delenv` keys
-rather than requiring them. `test_default_path_makes_zero_llm_calls` snapshots
-`sys.modules` and asserts no model_router/agent_loader/reasoning_agent/
-backtesting.engine/calibrator/openai/anthropic import on the default path —
-a genuine zero-LLM proof, not a tautology. No live feed, no broker, no orders.
+### f. Snapshot integration + serializer shape — PASS
+`build()` and `to_compact_dict()` both expose `fib_levels`, `liquidity_cycle`,
+`dol_target`, `ranked_dols`, and scope/role-tagged pools. `_compact_dict` keeps
+its shape: no raw candles, per-TF latest fib via `_fib_dict` (like
+premium_discount). Snapshot built twice from the same window+config is
+byte-identical (verified). `dol_target` is identically `ranked_dols[0]`.
 
-## Minor / non-blocking
+### g. Reasoning prompt + schema — PASS
+`ICT_SYSTEM_PROMPT` references `liquidity_cycle`, `dol_target`/`ranked_dols`,
+golden pocket / OTE 0.705, 0.382 retracement_target and negative extensions.
+The OUTPUT JSON schema keys are unchanged; `AlertPayload`/`parse_llm_json`
+imports and call sites intact; `alert.py` untouched. Only prose/docstring lines
+were removed from `reasoning_agent.py`.
 
-[LOW] Doc path drift
-File: workspace/contract.md
-Issue: contract references `workspace/scripts/run_tuning.py`; the actual file
-is `scripts/run_tuning.py` (project root). No functional impact — the default
-path imports `tuning.*` from `workspace/` correctly via sys.path setup.
-Fix: update the contract path reference.
+### h. No regression / offline — PASS (with the harness-fixture note above)
+No pre-existing assertion edited; all Phase 2B tests are NEW files. No test
+needs a live key. `pytest` green except the round-counter harness fixture,
+which is orthogonal to this phase.
 
-[LOW] Round-number discrepancy
-Issue: orchestrator says round 1 of 3; contract narrates "round 3". Cosmetic;
-graded independently on merits.
+### i. Weighted scoring — PASS (detailed under e./i.)
+
+### j. Review repairs — PASS
+- #1 ERL-only fallback: verified.
+- #2 wrong-side filter first in `_rank_dols`: verified.
+- #3 `ote["zone"]` from explicit ratios 0.62/0.79 — reordered/short `ote_grid`
+  (`(0.705,)`) does NOT IndexError and yields the correct zone: verified.
+- #4 role/scope reconciliation: scope is recomputed once against the HTF range;
+  see LOW note below.
+- #5 coincident ERL sources deduped on `(round(level,4), type)` keeping richest
+  role by fixed priority: present.
+- #6 opposing external in path lowers clarity_score via `clean_path` penalty;
+  prompt no_trades only on an opposing EXTERNAL pool between entry and target
+  (internal arrays are expected): verified in test + prompt text.
+- #7 prompt reads `liquidity_cycle` FIRST, before direction selection: verified.
+- #8 detectors not re-run inside `_build_pools`/`build`: the round-2 working-tree
+  fix threads the RAW detector outputs (`swings_raw`/`fvgs_raw`/`obs_raw`) — the
+  committed HEAD erroneously passed the serialized/truncated dicts
+  (`recent_swings`/`fvgs`/`order_blocks`). The fix is correct and the call-count
+  spy test pins it (`detect_swings`/`detect_fvg`/`detect_order_blocks` called 0×
+  when precomputed supplied). Landed.
+
+---
+
+## Findings
+
+### [LOW] Swing pool inside HTF range keeps role="swing" while scope="internal"
+File: workspace/trading/snapshot.py:493 (scope refinement loop)
+Issue: After range-relative refinement, a swing whose level falls inside the
+dealing range is correctly re-scoped to "internal" but retains role="swing".
+Under a strict reading of repair #4 ("no pool has role/scope that disagree"),
+role and scope appear to disagree.
+Assessment: This is the blueprint's *documented* precedence — "the range-derived
+scope wins and the role is retained for weighting." role encodes the *source*
+signal (a swing) as a scorer input; scope is the authoritative ERL/IRL tag. The
+scorer's `cycle_align` reads `scope` (not `role`), so no wrong-side target or
+mis-classification results. Behaviorally correct; not a defect.
+Fix (optional): if a strict role/scope agreement is desired, demote role to a
+neutral internal tag (e.g. "swing_ce") when refinement flips scope to internal,
+purely for legibility.
+
+### [INFO] Harness fixture `test_agent_loader` fails on round advance
+File: tests/test_agent_loader.py:51
+Issue: Assertion hardcodes "round 1 of 3"; now round 2. Outside the Phase 2B
+carve-out and outside `workspace/`. Not a Phase 2B regression. No action for the
+Executor within this phase.
+
+---
 
 ## Review Summary
 
-| Invariant | Severity if failed | Status |
-|-----------|--------------------|--------|
-| a. Frozen boundaries | CRITICAL | PASS |
-| b. Config behavior-preserving | CRITICAL | PASS |
-| c. Rescore reuses outcomes | HIGH | PASS |
-| d. Objective + MIN_TRADES | HIGH | PASS |
-| e. Walk-forward no leakage | CRITICAL | PASS |
-| f. Honesty diagnostics | HIGH/MEDIUM | PASS |
-| g. Tier-2 recording safety | HIGH | PASS |
-| h. Offline / no live key | CRITICAL | PASS |
-| Doc path / round labels | LOW | noted |
+| Invariant | Result |
+|-----------|--------|
+| a. Frozen-boundary carve-outs | PASS |
+| b. detect_fibonacci pure & exact | PASS |
+| c. ERL/IRL classification | PASS |
+| d. Cycle-state derivation (stateless) | PASS |
+| e./i. Weighted cycle-aware DOL, ERL-only fallback | PASS |
+| f. Snapshot + serializer shape + determinism | PASS |
+| g. Prompt updated, schema/parser unchanged | PASS |
+| h. No regression / offline | PASS (harness fixture note) |
+| j. Review repairs #1–#8 | PASS |
 
-All CRITICAL and HIGH invariants verified independently and pass. The two
-findings are LOW (documentation). 516 tests green offline. No blocking issues.
+No CRITICAL or HIGH findings. One LOW (documented, non-defect) and one
+informational harness note. The round-1 HIGH (repair #8) and the MEDIUM
+(missing scoring tests) are both resolved in the working tree.
 
 VERDICT: APPROVE

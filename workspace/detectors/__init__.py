@@ -17,6 +17,7 @@ Modules:
     order_blocks      — detect_order_blocks, detect_breaker_blocks
     inducement        — detect_turtle_soup, detect_inducement
     power_of_three    — detect_power_of_three
+    fibonacci         — detect_fibonacci
 """
 
 from .candles import validate_candles, candle_metrics
@@ -34,6 +35,7 @@ from .premium_discount import detect_premium_discount
 from .order_blocks import detect_order_blocks, detect_breaker_blocks
 from .inducement import detect_turtle_soup, detect_inducement
 from .power_of_three import detect_power_of_three
+from .fibonacci import detect_fibonacci
 
 __all__ = [
     "validate_candles",
@@ -58,4 +60,5 @@ __all__ = [
     "detect_turtle_soup",
     "detect_inducement",
     "detect_power_of_three",
+    "detect_fibonacci",
 ]

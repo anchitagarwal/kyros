@@ -1,12 +1,9 @@
 """reasoning_agent.py — LLM reasoning agent that turns a snapshot into an alert.
 
-Uses ``model_router.call()`` (NEVER ``call_agentic``) with the ICT system
-prompt. The snapshot is serialized to a compact JSON payload (no raw candle
-lists) and sent as the user message. The LLM's JSON response is parsed into
-an ``AlertPayload``; on any parse failure, a no_trade alert with
-``no_trade_reason="llm_parse_error"`` is returned (never raises).
+Phase 2B continuation: prompt reads liquidity_cycle BEFORE direction selection
+and uses ranked_dols (scored) as the default DOL.
 
-The ICT system prompt is embedded verbatim per the module layout spec.
+OUTPUT JSON SCHEMA / AlertPayload / parser remain unchanged.
 """
 
 from __future__ import annotations
@@ -19,26 +16,48 @@ from .alert import AlertPayload, parse_llm_json
 __all__ = ["LLMReasoningAgent", "ICT_SYSTEM_PROMPT"]
 
 
-# ── ICT System Prompt (verbatim per spec) ─────────────────────────────────────
-
 ICT_SYSTEM_PROMPT = """You are an ICT (Inner Circle Trader) futures analyst for NQ (Nasdaq E-Mini).
 You will receive a MarketSnapshot JSON. Your output must be ONLY a valid JSON
 object matching the AlertPayload schema. No prose. No markdown. No preamble.
 If you cannot produce a valid trade, output no_trade with a reason.
 
 DOL-FIRST REASONING — follow this sequence on every analysis:
-1. Read all_pools. These are all unswept liquidity levels sorted by proximity.
+1. Read liquidity_cycle (if present) FIRST.
+     - last_swept_erl_side: which ERL was just swept (buyside=BSL, sellside=SSL).
+     - current_leg: "seek_irl" (price drawing to internal liquidity) or
+       "expand_to_erl" (price expanding toward the opposite external ERL).
+     - target_erl_side: the opposite ERL side price is expected to draw to.
+     - agrees_with_htf_bias: whether the cycle target aligns with htf_bias.
+     If agrees_with_htf_bias is false, weight htf_bias over the cycle.
 2. Determine direction from htf_bias.
      bullish → target BSL pools above current_price
      bearish → target SSL pools below current_price
-3. Select your target pool (DOL).
-     Default to nearest_dol. Prefer higher confluence_count. Prefer pools
-     from higher timeframes (1h > 15m > 5m) when R:R still clears 1:1.
+3. Read ranked_dols. These are scored/sorted DOL candidates (highest clarity_score first).
+     Each ranked_dol includes score_breakdown factors:
+       timeframe, role, cycle_align, bias_align, confluence, pd_align, clean_path,
+       proximity, killzone.
+     Default to ranked_dols[0] as the DOL unless you name a higher-order override.
+     Prefer dol_target when present (it should equal ranked_dols[0]).
 4. INTERMEDIATE LIQUIDITY CHECK — mandatory, no exceptions.
-     If any unswept opposing pool sits between entry_mid and your selected
-     target → output no_trade, no_trade_reason: "intermediate liquidity in path"
-5. OTE modifier: if entry_zone overlaps the OTE band (61.8-79% retracement of
-     current dealing range from premium_discount) → add 15 conviction points.
+     ONLY an unswept opposing EXTERNAL (ERL) pool between entry_mid and your
+     selected target blocks the trade. Internal (IRL) arrays in the path are
+     EXPECTED draw targets, not blockers.
+     If an unswept opposing EXTERNAL pool sits between entry_mid and target →
+     output no_trade, no_trade_reason: "intermediate liquidity in path"
+5. OTE / Fibonacci modifier (read fib_levels per TF):
+     - If entry_zone overlaps the golden_pocket (0.618-0.66 retracement) →
+       add 15 conviction points.
+     - If entry sits at the OTE 0.705 primary (ote_primary) → add 10 more.
+     - (The legacy 61.8-79% OTE band from premium_discount still applies.)
+
+ENTRY / TARGET LOGIC (Fibonacci-aware):
+     - premium_array true (price above equilibrium) → favor SHORT, target the
+       discount / sellside ERL below.
+     - premium_array false (price below equilibrium) → favor LONG, target the
+       buyside ERL above.
+     - Entries at the golden_pocket (0.618-0.66) or OTE 0.705 primary.
+     - Targets: 0.382 retracement_target for the first partial, then negative
+       extensions (extensions: -0.5, -1.0, -1.5, -2.0, -2.5) toward the opposite ERL.
 
 ICT MODEL IDENTIFICATION — check in this order:
 
@@ -67,8 +86,7 @@ ifvg:
   Current price approaching or testing iFVG zone from the new side.
 
 breaker:
-  breaker_blocks contains an entry near current_price (these are former OBs that
-  have been mitigated and flipped — they now act as opposing S/R).
+  breaker_blocks contains an entry near current_price.
   When both breaker and ifvg conditions are present at the same level,
   prefer breaker.
 
@@ -94,24 +112,13 @@ OUTPUT SCHEMA — return ONLY this JSON object, nothing else:
 
 
 def _extract_json(text: str) -> dict | None:
-    """Extract a JSON object from an LLM text response.
-
-    Handles three cases:
-      1. The text is pure JSON.
-      2. The JSON is wrapped in a ```json ... ``` fenced block.
-      3. The JSON is embedded in prose (find the first {...} block).
-
-    Returns the parsed dict, or None if no valid JSON object is found.
-    """
     text = text.strip()
-    # Case 1: pure JSON.
     try:
         obj = json.loads(text)
         if isinstance(obj, dict):
             return obj
     except json.JSONDecodeError:
         pass
-    # Case 2: fenced code block.
     m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if m:
         try:
@@ -120,7 +127,6 @@ def _extract_json(text: str) -> dict | None:
                 return obj
         except json.JSONDecodeError:
             pass
-    # Case 3: first {...} block (greedy enough to capture nested braces).
     m = re.search(r"\{.*\}", text, re.DOTALL)
     if m:
         try:
@@ -133,44 +139,22 @@ def _extract_json(text: str) -> dict | None:
 
 
 class LLMReasoningAgent:
-    """Turn a MarketSnapshot into an AlertPayload via a single LLM call."""
-
-    def __init__(self, model_router, system_prompt: str = ICT_SYSTEM_PROMPT,
-                 agent_config: dict | None = None):
-        """Args:
-            model_router: a ModelRouter instance (uses .call() only).
-            system_prompt: the ICT system prompt (defaults to the verbatim spec).
-            agent_config: the agent_config dict for model_router.call(). If
-                None, a minimal config is built from the router's defaults.
-        """
+    def __init__(self, model_router, system_prompt: str = ICT_SYSTEM_PROMPT, agent_config: dict | None = None):
         self.model_router = model_router
         self.system_prompt = system_prompt
         self.agent_config = agent_config or self._default_agent_config()
 
     @staticmethod
     def _default_agent_config() -> dict:
-        """A minimal agent_config for model_router.call().
-
-        The executor in .kyros_state.json uses zai/glm-5.2; we mirror that
-        so a real router call would work, though tests always mock the router.
-        """
         return {
             "model_engine": {"provider": "zai", "model": "glm-5.2", "temperature": 0.0},
             "final_system_prompt": "",
         }
 
     def reason(self, snapshot) -> AlertPayload:
-        """Produce an AlertPayload from ``snapshot`` via one LLM call.
-
-        Serializes the snapshot to compact JSON (no raw candles), calls
-        model_router.call() exactly once, parses the JSON response. On any
-        parse failure, returns no_trade with no_trade_reason="llm_parse_error".
-        Never raises.
-        """
         payload = snapshot.to_compact_dict()
         user_msg = json.dumps(payload, default=str)
 
-        # Build the agent_config with our system prompt injected.
         config = dict(self.agent_config)
         config["final_system_prompt"] = self.system_prompt
 
@@ -181,7 +165,6 @@ class LLMReasoningAgent:
             )
             content = response.content
         except Exception:
-            # Router failure → no_trade, never crash the loop.
             return AlertPayload(bias="no_trade", no_trade_reason="llm_parse_error")
 
         data = _extract_json(content)
