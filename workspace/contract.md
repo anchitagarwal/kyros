@@ -1,66 +1,41 @@
-# Phase 2B Executor Contract (update)
+# Phase 2B Contract (Executor)
 
-## Resume check (current repo state)
-- `.kyros_state.json` exists at repo root (NOT under `workspace/`). Current phase: `phase_2b`. `evaluator_round=2`, `max_evaluator_rounds=3`.
-- Test status: `uv run pytest` currently **fails** with 1 failure:
-  - `tests/test_agent_loader.py::test_evaluator_prompt_includes_current_round_context` expects evaluator prompt to include `"round 1 of 3"`.
-- Phase 2B continuation items (weighted DOL scoring) are **not implemented** in `workspace/trading/`:
-  - No `_score_pool`, `_rank_dols`, `ranked_dols`, `clarity_score`, `score_breakdown`.
-  - `_dol_target` still uses `_nearest_internal/_nearest_external` first-match logic.
-  - `_build_pools` dedup is by `(level,type,role)` not `(level,type)`.
-  - `reasoning_agent.py` prompt still uses the forbidden `1, 2, 1.5, 3` ordering.
+State source: `.kyros_state.json` indicates `current_phase=phase_2b`, `last_review_status=BLOCK`, evaluator round 1/3 with a HIGH finding.
 
-## Frozen boundaries (must remain true)
-- `workspace/detectors/`: ONLY allowed changes are adding `fibonacci.py` (already present) and its single export line in `__init__.py` (already present). No other detector edits.
-- `workspace/trading/`: only additive changes per Phase 2B continuation spec. `_nearest_dol` must remain byte-identical.
-- `workspace/backtesting/` and `workspace/tuning/`: off-limits.
+## What exists (baseline)
+- `workspace/detectors/fibonacci.py` exists and `detect_fibonacci()` is implemented and tested.
+- `workspace/trading/snapshot.py` contains:
+  - `LiquidityPool` with new fields `scope`, `role`, `clarity_score`, `score_breakdown`.
+  - `MarketSnapshot` with `fib_levels`, `liquidity_cycle`, `ranked_dols`, `dol_target`.
+  - Weighted DOL scoring: `_score_pool`, `_rank_dols`, `_dol_target`.
+  - `_nearest_dol` present and must remain byte-identical.
+- `workspace/trading/config.py` contains fib knobs, IRL gating, cycle toggle, and weight maps.
+- Tests exist under `tests/test_fibonacci.py` and `tests/phase2/test_fib_liquidity_cycle.py`.
 
-## Planned changes (mapped to review findings)
+## Review.md / evaluator findings to address
+### [HIGH] Repair #8 not landed — `_build_pools` ignores `precomputed`
+- File: `workspace/trading/snapshot.py`
+- Required fix: `_build_pools` must consume precomputed detector outputs passed from `build()` so detectors are not re-run on identical candles.
+  - Use raw `detect_swings` output per TF for swing pools.
+  - Use HTF `detect_fvg` and `detect_order_blocks` outputs for IRL pools.
 
-### A) Fix failing test: evaluator round context (tests/test_agent_loader.py)
-- **Why**: suite currently failing; must be green before Phase 2B work can be validated.
-- **Change**: update `config/prompts.yaml` evaluator prompt to include a literal `ROUND CONTEXT` section containing `"round 1 of 3"` (lowercased match) and ensure it does **not** include `"FINAL allowed round"` by default.
-- **Note**: This is outside `workspace/`, but required to restore baseline green tests.
+### [MEDIUM] Missing scoring behavior tests
+- Add tests in `tests/phase2/` to pin:
+  - proximity does not dominate,
+  - monotonicity of key factors,
+  - wrong-side exclusion,
+  - clean_path penalty,
+  - breakdown sums to score,
+  - and a call-count spy test for repair #8.
 
-### B) Implement weighted DOL scoring continuation (review HIGH #1-#3)
-Files: `workspace/trading/config.py`, `workspace/trading/snapshot.py`, `workspace/trading/reasoning_agent.py`, plus new tests under `tests/phase2/`.
+## Planned changes (mapping to blueprint components)
+1. **snapshot.py**
+   - Thread raw detector outputs through `build()` into `_build_pools(precomputed=...)`.
+   - Update `_build_pools` to use `precomputed` when provided, falling back to running detectors only when missing.
+   - Keep `_nearest_dol` byte-identical.
 
-1) `workspace/trading/config.py`
-- Add defaults + accessors:
-  - `_DEFAULT_DOL_WEIGHTS`, `_DEFAULT_TF_WEIGHTS`, `_DEFAULT_ROLE_WEIGHTS` (tuple-of-tuples)
-  - `dol_weights_dict()`, `tf_weights_dict()`, `role_weights_dict()`
-  - `ranked_dols_to_llm: int = 5`
-- Extend `config_hash()` canonical dict with these new knobs.
+2. **tests/phase2/**
+   - Extend `tests/phase2/test_fib_liquidity_cycle.py` with the promised scoring tests.
+   - Add a spy/call-count test using `unittest.mock.patch` to ensure `detect_swings` is not called inside `_build_pools` when precomputed swings are supplied, and HTF `detect_fvg`/`detect_order_blocks` are not re-run.
 
-2) `workspace/trading/snapshot.py`
-- Extend `LiquidityPool` (defaulted): `clarity_score: float = 0.0`, `score_breakdown: dict = field(default_factory=dict)`.
-- Extend `LiquidityPool.to_dict()` to emit `clarity_score` and `score_breakdown`.
-- Extend `MarketSnapshot` (defaulted): `ranked_dols: list[LiquidityPool] = field(default_factory=list)`.
-- Add `_score_pool` (pure) and `_rank_dols` (direction-filter then score then sort desc; stable distance tiebreak).
-- Rewrite `_dol_target`:
-  - If `cycle is None` or `dol_use_cycle` False → call `_nearest_dol` over **ERL-only** pools (`scope=="external"`) (repair #1) while keeping `_nearest_dol` unchanged.
-  - Else → return `_rank_dols(...)[0]` (or None).
-  - Delete `_nearest_internal` and `_nearest_external`.
-- Add `ranked_dols` population in `build()` and ensure `dol_target == ranked_dols[0]` when cycle active.
-- Update `_compact_dict` to include `ranked_dols` (top-N via config) and serialize `dol_target` accordingly.
-
-3) `workspace/trading/snapshot.py` dedup repair (review MEDIUM #6 / repair #5)
-- Change dedup to merge on `(level,type)` keeping richest role by priority and recompute confluence on merged set.
-
-4) `workspace/trading/reasoning_agent.py` prompt repair (review HIGH #5 / repair #7)
-- Reorder steps so cycle read precedes direction selection; remove fractional numbering.
-- Update DOL step to use `ranked_dols` and default to top `clarity_score`.
-- Keep OUTPUT JSON schema unchanged.
-
-### C) Add/extend tests for scoring (review HIGH #3)
-- Add tests under `tests/phase2/`:
-  - `_score_pool` monotonicity for key factors.
-  - `_rank_dols` wrong-side exclusion.
-  - Core behavior: farther high-TF external pool beats nearer low-TF pool (proximity does not dominate).
-  - Determinism: same inputs → identical ranked list + breakdown.
-  - Fallback: cycle None / dol_use_cycle False equals `_nearest_dol` over ERL-only set.
-
-## Verification steps
-- Run `uv run pytest` after each file change.
-- Confirm `_nearest_dol` remains byte-identical (manual diff / grep).
-- Ensure only golden updates are serializer additions (scope/role/clarity_score/ranked_dols) where applicable.
+No changes are planned outside `workspace/` except additive/adjustment tests under `tests/`.

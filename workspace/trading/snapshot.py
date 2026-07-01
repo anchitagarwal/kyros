@@ -218,6 +218,11 @@ class SnapshotBuilder:
         recent_inducements: dict[str, list[dict]] = {}
         po3_phase: dict[str, list[dict]] = {}
 
+        # Raw detector outputs (threaded into _build_pools to avoid re-running).
+        swings_raw: dict[str, list[dict]] = {}
+        fvgs_raw: dict[str, list[dict]] = {}
+        obs_raw: dict[str, list[dict]] = {}
+
         for tf in TIMEFRAMES:
             candles = candles_by_tf[tf]
             if not candles:
@@ -225,9 +230,13 @@ class SnapshotBuilder:
                           order_blocks, breaker_blocks, volume_imbalances, opening_gaps, recent_sweeps,
                           displacements, recent_inducements, po3_phase):
                     d[tf] = []
+                swings_raw[tf] = []
+                fvgs_raw[tf] = []
+                obs_raw[tf] = []
                 continue
 
             swings = detect_swings(candles)
+            swings_raw[tf] = swings
             recent_swings[tf] = [_swing_dict(s) for s in swings[-self._cap("recent_swings", 5):]]
 
             breaks = detect_bos(candles) + detect_choch(candles)
@@ -251,10 +260,12 @@ class SnapshotBuilder:
             fib_levels[tf] = fib[-self._cap("fib_levels", 1):]
 
             fvg_list = detect_fvg(candles)
+            fvgs_raw[tf] = fvg_list
             fvgs[tf] = [_fvg_dict(f) for f in fvg_list[-self._cap("fvgs", 5):]]
             ifvgs[tf] = [_ifvg_dict(f) for f in detect_ifvg(candles)[-self._cap("ifvgs", 5):]]
 
             obs = detect_order_blocks(candles)
+            obs_raw[tf] = obs
             order_blocks[tf] = [_ob_dict(o) for o in obs if not o.get("mitigated")][-self._cap("order_blocks", 5):]
 
             breaker_blocks[tf] = [_breaker_dict(b) for b in detect_breaker_blocks(candles)[-self._cap("breaker_blocks", 5):]]
@@ -281,9 +292,9 @@ class SnapshotBuilder:
             session_levels,
             htf_fib,
             precomputed={
-                "swings": recent_swings,
-                "fvgs": fvgs,
-                "order_blocks": order_blocks,
+                "swings": swings_raw,
+                "fvgs": fvgs_raw,
+                "order_blocks": obs_raw,
             },
         )
         nearest_dol = self._nearest_dol(all_pools, htf_bias, current_price)
@@ -373,9 +384,14 @@ class SnapshotBuilder:
         current_price: float,
         session_levels: dict | None = None,
         htf_fib: dict | None = None,
-        precomputed: dict | None = None,
+        *,
+        precomputed: dict[str, dict[str, list[dict]]],
     ) -> list[LiquidityPool]:
         raw: list[tuple[float, str, str, Any, str, str]] = []
+
+        swings_by_tf = precomputed["swings"]
+        fvgs_by_tf = precomputed["fvgs"]
+        obs_by_tf = precomputed["order_blocks"]
 
         for tf in TIMEFRAMES:
             candles = candles_by_tf.get(tf, [])
@@ -391,7 +407,7 @@ class SnapshotBuilder:
                 ptype = "bsl" if pl["type"] in ("pdh", "pwh") else "ssl"
                 raw.append((pl["level"], ptype, tf, pl["timestamp"], "external", "prior"))
 
-            swings = detect_swings(candles)
+            swings = swings_by_tf[tf]
             highs = [s for s in swings if s["type"] == "swing_high"]
             lows = [s for s in swings if s["type"] == "swing_low"]
             if highs:
@@ -419,12 +435,14 @@ class SnapshotBuilder:
                 htf_tf = tf
                 break
         if htf_tf is not None:
-            htf_candles = candles_by_tf[htf_tf]
+            fvgs_htf = fvgs_by_tf[htf_tf]
+            obs_htf = obs_by_tf[htf_tf]
+
             if "fvg" in self._irl_sources:
-                for fvg in detect_fvg(htf_candles):
+                for fvg in fvgs_htf:
                     raw.append((fvg["midpoint"], _pool_type_for(fvg["midpoint"], current_price), htf_tf, fvg["timestamp"], "internal", "fvg_ce"))
             if "order_block" in self._irl_sources:
-                for ob in detect_order_blocks(htf_candles):
+                for ob in obs_htf:
                     if ob.get("mitigated"):
                         continue
                     centre = (ob["top"] + ob["bottom"]) / 2.0

@@ -12,26 +12,33 @@ All offline (no API key). Tests the additive Phase 2B surfaces:
 
 Phase 2B continuation:
   - ranked_dols + clarity_score/score_breakdown surfaces exist.
+  - scoring behavior is pinned (proximity does not dominate, wrong-side filter,
+    clean_path penalty, monotonicity, breakdown sums).
+  - repair #8 pinned: detectors are not re-run inside _build_pools when
+    precomputed outputs are supplied.
 """
 
 import json
 from datetime import datetime
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from trading.candle_source import MockCandleSource, TIMEFRAMES
+from trading.candle_source import MockCandleSource
 from trading.candle_window import CandleWindow, DEFAULT_SIZES
 from trading.config import TradingConfig
 from trading.snapshot import (
     SnapshotBuilder,
     LiquidityPool,
+    TIMEFRAMES,
 )
 from trading.reasoning_agent import LLMReasoningAgent, ICT_SYSTEM_PROMPT
 from trading.alert import AlertPayload
 
 _NY = ZoneInfo("America/New_York")
+_BULLISH_EXPAND_CYCLE = {"current_leg": "expand_to_erl", "target_erl_side": "buyside"}
+_BASE_HTF_FIB = {"range_low": 100.0, "range_high": 200.0, "equilibrium": 150.0}
 
 
 def _build_window(scenario, n=100):
@@ -114,10 +121,10 @@ def test_cycle_ssl_sweep_with_reversal_bos_expand_to_erl():
 # ── _dol_target (updated signature) ─────────────────────────────────────────-
 
 
-def _pool(level, ptype="bsl", scope="external", role="swing", swept=False):
+def _pool(level, ptype="bsl", scope="external", role="swing", swept=False, tf="1h", conf=0, dist_from=200.0):
     return LiquidityPool(
-        level=level, type=ptype, timeframe="1h",
-        distance_points=abs(level - 200.0), confluence_count=0,
+        level=level, type=ptype, timeframe=tf,
+        distance_points=abs(level - dist_from), confluence_count=conf,
         swept=swept, scope=scope, role=role,
     )
 
@@ -137,6 +144,130 @@ def test_dol_target_cycle_active_uses_ranked():
     res = b._dol_target(pools, cycle, "bearish", 200.0, None, None)
     assert res is not None
     assert res.type == "ssl"
+
+
+# ── Scoring behavior (continuation phase) ─────────────────────────────────────
+
+
+def test_score_breakdown_sums_to_score():
+    b = SnapshotBuilder()
+    pool = _pool(210, "bsl", scope="external", role="equal", tf="4h", conf=2)
+    score, breakdown = b._score_pool(
+        pool,
+        htf_bias="bullish",
+        cycle=_BULLISH_EXPAND_CYCLE,
+        htf_fib=_BASE_HTF_FIB,
+        current_price=200.0,
+        killzone=None,
+        pools=[pool],
+    )
+    assert pytest.approx(sum(breakdown.values()), rel=0, abs=1e-9) == score
+
+
+def test_rank_dols_filters_wrong_side_first():
+    b = SnapshotBuilder()
+    current_price = 200.0
+    pools = [
+        _pool(210, "bsl", scope="external"),
+        _pool(190, "ssl", scope="external"),
+        _pool(220, "bsl", scope="external"),
+    ]
+    cycle = _BULLISH_EXPAND_CYCLE
+    ranked = b._rank_dols(pools, htf_bias="bullish", cycle=cycle, htf_fib=None, current_price=current_price, killzone=None)
+    assert ranked
+    assert all(p.level > current_price and p.type == "bsl" for p in ranked)
+
+
+def test_clean_path_penalizes_opposing_external_between_price_and_target():
+    b = SnapshotBuilder()
+    current_price = 200.0
+    target = _pool(230, "bsl", scope="external", role="equal", tf="4h")
+    blocker = _pool(215, "ssl", scope="external", role="equal", tf="4h")
+    score_clean, _ = b._score_pool(
+        target,
+        htf_bias="bullish",
+        cycle=_BULLISH_EXPAND_CYCLE,
+        htf_fib=_BASE_HTF_FIB,
+        current_price=current_price,
+        killzone=None,
+        pools=[target],
+    )
+    score_blocked, _ = b._score_pool(
+        target,
+        htf_bias="bullish",
+        cycle=_BULLISH_EXPAND_CYCLE,
+        htf_fib=_BASE_HTF_FIB,
+        current_price=current_price,
+        killzone=None,
+        pools=[target, blocker],
+    )
+    assert score_blocked < score_clean
+
+
+def test_confluence_monotonic_increases_score():
+    b = SnapshotBuilder()
+    base = _pool(210, "bsl", scope="external", role="equal", tf="4h", conf=0)
+    more = _pool(210, "bsl", scope="external", role="equal", tf="4h", conf=3)
+    s0, _ = b._score_pool(
+        base,
+        htf_bias="bullish",
+        cycle=_BULLISH_EXPAND_CYCLE,
+        htf_fib=_BASE_HTF_FIB,
+        current_price=200.0,
+        killzone=None,
+        pools=[base],
+    )
+    s1, _ = b._score_pool(
+        more,
+        htf_bias="bullish",
+        cycle=_BULLISH_EXPAND_CYCLE,
+        htf_fib=_BASE_HTF_FIB,
+        current_price=200.0,
+        killzone=None,
+        pools=[more],
+    )
+    assert s1 > s0
+
+
+def test_proximity_does_not_dominate_far_high_tf_equal_beats_near_low_tf_swing():
+    b = SnapshotBuilder()
+    current_price = 200.0
+    # Near but weak.
+    near = _pool(201.0, "bsl", scope="external", role="swing", tf="1m", dist_from=current_price)
+    # Far but strong.
+    far = _pool(218.0, "bsl", scope="external", role="equal", tf="4h", dist_from=current_price)
+    cycle = _BULLISH_EXPAND_CYCLE
+    ranked = b._rank_dols([near, far], htf_bias="bullish", cycle=cycle, htf_fib=_BASE_HTF_FIB, current_price=current_price, killzone=None)
+    assert ranked[0] is far
+    assert ranked[0].clarity_score > ranked[1].clarity_score
+
+
+# ── Repair #8: detectors not re-run inside _build_pools when precomputed ─────-
+
+
+def test_build_pools_uses_precomputed_detectors_no_rerun():
+    b = SnapshotBuilder()
+    candles_by_tf = {tf: [] for tf in TIMEFRAMES}
+    # Minimal candles to avoid early exits.
+    candles_by_tf["1h"] = [{"timestamp": _ts(0), "open": 1, "high": 2, "low": 0.5, "close": 1.5}]
+    candles_by_tf["4h"] = [{"timestamp": _ts(0), "open": 1, "high": 2, "low": 0.5, "close": 1.5}]
+
+    pre = {
+        "swings": {tf: [] for tf in TIMEFRAMES},
+        "fvgs": {tf: [] for tf in TIMEFRAMES},
+        "order_blocks": {tf: [] for tf in TIMEFRAMES},
+    }
+    pre["swings"].update({
+        "1h": [{"type": "swing_high", "price": 2.0, "timestamp": _ts(0)}],
+        "4h": [{"type": "swing_low", "price": 0.5, "timestamp": _ts(0)}],
+    })
+
+    with patch("trading.snapshot.detect_swings") as p_swings, patch("trading.snapshot.detect_fvg") as p_fvg, patch("trading.snapshot.detect_order_blocks") as p_ob:
+        b._build_pools(candles_by_tf, current_price=1.5, session_levels={}, htf_fib=None, precomputed=pre)
+        # swings/fvg/ob should not be called because precomputed provides them.
+        assert p_swings.call_count == 0
+        assert p_fvg.call_count == 0
+        assert p_ob.call_count == 0
 
 
 # ── Snapshot integration ─────────────────────────────────────────────────────-
